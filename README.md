@@ -103,3 +103,14 @@ curl -X POST http://localhost:9200/articles/_search \
     }
   }'
 ```
+
+## MCP (Model Context Protocol)
+
+Tanpopo is an MCP server for agentic search. Tools: `list_indices`, `search`, `get_document`, `analyze_text`.
+
+- HTTP: `POST http://localhost:9200/mcp` (JSON-RPC 2.0)
+- stdio: `tanpopo --mcp` (or `TANPOPO_MCP_STDIO=1`; logs go to stderr)
+
+```json
+{ "mcpServers": { "tanpopo": { "command": "tanpopo", "args": ["--mcp"], "env": { "TANPOPO_DATA_DIR": "./data" } } } }
+```

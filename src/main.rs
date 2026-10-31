@@ -9,7 +9,10 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mcp_stdio = env::args().any(|a| a == "--mcp") || env::var("TANPOPO_MCP_STDIO").is_ok_and(|v| v == "1");
+    // stdout is reserved for JSON-RPC in stdio mode
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
@@ -28,6 +31,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let dict = load_dictionary_from_dir(dict_dir.as_deref(), dict_path.as_deref())?;
     let mgr = Arc::new(IndexManager::new(data_dir.clone(), dict, writer_heap_bytes)?);
+    if mcp_stdio {
+        return Ok(tokio::task::spawn_blocking(move || tanpopo::mcp::run_stdio_loop(mgr)).await??);
+    }
     let app = build_router(mgr);
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;

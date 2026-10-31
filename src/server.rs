@@ -42,6 +42,7 @@ impl IntoResponse for AppError {
 pub fn build_router(state: SharedState) -> Router {
     Router::new()
         .route("/", get(root_handler))
+        .route("/mcp", post(mcp_http_handler))
         .route("/_cluster/health", get(cluster_health_handler))
         .route("/_cluster/health/{index}", get(cluster_health_handler))
         .route("/_cat/indices", get(cat_indices_handler))
@@ -90,6 +91,13 @@ async fn add_elastic_header(mut res: Response) -> Response {
     res
 }
 
+async fn mcp_http_handler(State(mgr): State<SharedState>, Json(payload): Json<Value>) -> Response {
+    match crate::mcp::handle_mcp_value(&mgr, payload) {
+        Some(res) => Json(res).into_response(),
+        None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
 async fn root_handler() -> Json<Value> {
     Json(json!({
         "name": "tanpopo",
@@ -132,7 +140,7 @@ async fn cat_indices_handler(State(mgr): State<SharedState>) -> Result<Json<Valu
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct AnalyzeRequest {
+pub(crate) struct AnalyzeRequest {
     text: Value,
     #[serde(default)]
     analyzer: Option<String>,
@@ -164,7 +172,7 @@ async fn analyze_index_handler(
     run_analyze(&mgr, Some(&managed), req)
 }
 
-fn run_analyze(
+pub(crate) fn run_analyze(
     mgr: &IndexManager,
     managed: Option<&Arc<ManagedIndex>>,
     req: AnalyzeRequest,

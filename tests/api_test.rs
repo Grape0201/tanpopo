@@ -497,3 +497,66 @@ async fn test_user_dictionary_from_dir_and_rest_analyze() {
     assert_eq!(search_res["hits"]["total"]["value"], 1);
     assert_eq!(search_res["hits"]["hits"][0]["_id"], "1");
 }
+
+#[tokio::test]
+async fn test_mcp_jsonrpc_endpoints() {
+    let tmp_dir = TempDir::new().unwrap();
+    let dict = build_fallback_dictionary().unwrap();
+    let mgr = Arc::new(IndexManager::new(tmp_dir.path().to_path_buf(), dict, 15_000_000).unwrap());
+    let app = build_router(mgr);
+
+    send_json(
+        &app,
+        Method::PUT,
+        "/articles/_doc/1",
+        Some(json!({ "title": "関西国際空港の案内", "views": 120 })),
+    )
+    .await;
+
+    let rpc = |id: u64, method: &str, params: Value| {
+        Some(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+    };
+    let call = |name: &str, args: Value| rpc(2, "tools/call", json!({ "name": name, "arguments": args }));
+
+    let (status, res) = send_json(&app, Method::POST, "/mcp", rpc(1, "initialize", json!({}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(res["result"]["capabilities"]["tools"].is_object());
+
+    // notification: no id => 202
+    let (status, _) = send_json(
+        &app,
+        Method::POST,
+        "/mcp",
+        Some(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let (_, res) = send_json(&app, Method::POST, "/mcp", rpc(1, "tools/list", json!({}))).await;
+    assert_eq!(res["result"]["tools"].as_array().unwrap().len(), 4);
+
+    let tool_text = |res: &Value| -> Value {
+        assert_eq!(res["result"]["isError"], false, "{res}");
+        serde_json::from_str(res["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    };
+
+    let (_, res) = send_json(&app, Method::POST, "/mcp", call("list_indices", json!({}))).await;
+    let v = tool_text(&res);
+    assert_eq!(v[0]["index"], "articles");
+    assert_eq!(v[0]["docs_count"], 1);
+
+    let (_, res) = send_json(&app, Method::POST, "/mcp", call("search", json!({ "index": "articles", "q": "関西国際空港" }))).await;
+    let v = tool_text(&res);
+    assert_eq!(v["hits"]["total"]["value"], 1);
+    assert_eq!(v["hits"]["hits"][0]["_source"]["views"], 120);
+
+    let (_, res) = send_json(&app, Method::POST, "/mcp", call("get_document", json!({ "index": "articles", "id": "1" }))).await;
+    assert_eq!(tool_text(&res)["_source"]["title"], "関西国際空港の案内");
+
+    let (_, res) = send_json(&app, Method::POST, "/mcp", call("analyze_text", json!({ "text": "全文検索エンジン", "mode": "A" }))).await;
+    assert_eq!(tool_text(&res)["tokens"].as_array().unwrap().len(), 3);
+
+    // tool errors surface as isError so the agent can retry
+    let (_, res) = send_json(&app, Method::POST, "/mcp", call("get_document", json!({ "index": "nope", "id": "1" }))).await;
+    assert_eq!(res["result"]["isError"], true);
+}
