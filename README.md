@@ -23,6 +23,8 @@ Just as Tantivy takes inspiration from the French word for dandelion, Tanpopo br
   - `POST /_search`, `POST /:index/_search`, `GET /:index/_search?q=...` (`match`, `match_phrase`, `multi_match`, `term`, `terms`, `wildcard`, `range`, `bool`, `query_string`, `aggs`, `sort`, `docvalue_fields`)
   - `POST /_msearch`, `POST /:index/_msearch` (NDJSON)
 
+- **Built-in Web UI**: a single-file search / analyze console at `http://localhost:9200/_ui` (no extra dependencies). Set `TANPOPO_UI=0` to disable it.
+
 ## Quick Start
 
 ### 1. Prepare Sudachi Dictionaries (System + Optional User Dictionaries)

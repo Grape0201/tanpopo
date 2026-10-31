@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tanpopo UI</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; background: #fafafa; color: #222; }
+  header { background: #f5c400; padding: 8px 16px; font-weight: bold; }
+  main { max-width: 960px; margin: 0 auto; padding: 16px; }
+  nav button { padding: 6px 16px; border: 1px solid #ccc; background: #eee; cursor: pointer; }
+  nav button.on { background: #fff; border-bottom-color: #fff; font-weight: bold; }
+  section { background: #fff; border: 1px solid #ccc; padding: 16px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; align-items: center; }
+  input[type=text], textarea, select { padding: 6px; font: inherit; }
+  input.q { flex: 1; min-width: 240px; }
+  textarea { width: 100%; box-sizing: border-box; font-family: monospace; min-height: 120px; }
+  button.go { padding: 6px 16px; }
+  .hit { border-top: 1px solid #ddd; padding: 8px 0; }
+  .meta { color: #666; font-size: 0.85em; }
+  pre { background: #f4f4f4; padding: 8px; overflow: auto; margin: 4px 0; }
+  .err { color: #b00020; }
+  table { border-collapse: collapse; margin: 4px 0 12px; }
+  td, th { border: 1px solid #ccc; padding: 2px 8px; text-align: left; }
+</style>
+</head>
+<body>
+<header>🌼 Tanpopo</header>
+<main>
+<nav>
+  <button id="t-search" class="on">検索</button><button id="t-analyze">形態素解析</button>
+</nav>
+
+<section id="p-search">
+  <div class="row">
+    <select id="index"></select>
+    <input id="q" class="q" type="text" placeholder="検索クエリ（例: 空港）">
+    <button id="go" class="go">検索</button>
+  </div>
+  <div class="row">
+    <label>種別
+      <select id="kind"><option>query_string</option><option>match</option></select>
+    </label>
+    <label>フィールド <input id="field" type="text" size="14" placeholder="match時は必須"></label>
+    <label>size <input id="size" type="text" size="3" value="10"></label>
+    <label>from <input id="from" type="text" size="3" value="0"></label>
+  </div>
+  <details>
+    <summary>リクエスト JSON（編集して送信可）</summary>
+    <textarea id="body"></textarea>
+    <button id="raw" class="go">このJSONで検索</button>
+  </details>
+  <div id="summary" class="meta"></div>
+  <div id="hits"></div>
+</section>
+
+<section id="p-analyze" hidden>
+  <div class="row">
+    <input id="text" class="q" type="text" value="関西国際空港に行く">
+    <select id="mode"><option>A</option><option>B</option><option>C</option></select>
+    <select id="form"><option>normalized</option><option>dictionary</option><option>surface</option></select>
+    <button id="an" class="go">解析</button>
+    <button id="abc" class="go">A/B/C 比較</button>
+  </div>
+  <div id="tokens"></div>
+</section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const call = async (path, body) => {
+  const r = await fetch(path, body === undefined ? {} : {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(JSON.stringify(j));
+  return j;
+};
+const el = (tag, text, cls) => {
+  const e = document.createElement(tag);
+  if (text !== undefined) e.textContent = text;
+  if (cls) e.className = cls;
+  return e;
+};
+
+for (const t of ['search', 'analyze']) {
+  $('t-' + t).onclick = () => {
+    for (const u of ['search', 'analyze']) {
+      $('p-' + u).hidden = u !== t;
+      $('t-' + u).classList.toggle('on', u === t);
+    }
+  };
+}
+
+// ---- search ----
+function buildBody() {
+  const q = $('q').value, f = $('field').value.trim();
+  let query;
+  if (!q) query = { match_all: {} };
+  else if ($('kind').value === 'match') query = { match: { [f]: q } };
+  else query = { query_string: f ? { query: q, default_field: f } : { query: q } };
+  return { query, size: +$('size').value || 10, from: +$('from').value || 0 };
+}
+async function run(body) {
+  $('hits').replaceChildren(); $('summary').className = 'meta';
+  try {
+    const idx = $('index').value;
+    const res = await call((idx ? '/' + encodeURIComponent(idx) : '') + '/_search', body);
+    const total = res.hits.total.value;
+    $('summary').textContent = `${total} 件 / ${res.took ?? '-'} ms`;
+    for (const h of res.hits.hits) {
+      const d = el('div', undefined, 'hit');
+      d.append(el('div', `score ${h._score ?? '-'}  id ${h._id}  index ${h._index ?? ''}`, 'meta'),
+               el('pre', JSON.stringify(h._source, null, 2)));
+      $('hits').append(d);
+    }
+  } catch (e) { $('summary').className = 'err'; $('summary').textContent = e.message; }
+}
+$('go').onclick = () => { const b = buildBody(); $('body').value = JSON.stringify(b, null, 2); run(b); };
+$('q').onkeydown = e => { if (e.key === 'Enter') $('go').click(); };
+$('raw').onclick = () => {
+  try { run(JSON.parse($('body').value)); }
+  catch (e) { $('summary').className = 'err'; $('summary').textContent = e.message; }
+};
+(async () => {
+  $('index').append(new Option('(全インデックス)', ''));
+  try {
+    for (const i of await call('/_cat/indices'))
+      $('index').append(new Option(`${i.index} (${i['docs.count']})`, i.index));
+  } catch (e) { $('summary').textContent = e.message; }
+})();
+
+// ---- analyze ----
+async function analyze(mode) {
+  const res = await call('/_analyze', { text: $('text').value, mode, form: $('form').value });
+  const box = el('div');
+  box.append(el('b', `mode ${mode}`));
+  const tbl = el('table');
+  const toks = res.tokens || [];
+  const keys = toks.length ? Object.keys(toks[0]) : [];
+  const head = el('tr'); keys.forEach(k => head.append(el('th', k))); tbl.append(head);
+  for (const t of toks) {
+    const tr = el('tr'); keys.forEach(k => tr.append(el('td', String(t[k] ?? '')))); tbl.append(tr);
+  }
+  box.append(tbl);
+  return box;
+}
+const showAnalyze = async modes => {
+  $('tokens').replaceChildren();
+  try { for (const m of modes) $('tokens').append(await analyze(m)); }
+  catch (e) { $('tokens').append(el('div', e.message, 'err')); }
+};
+$('an').onclick = () => showAnalyze([$('mode').value]);
+$('abc').onclick = () => showAnalyze(['A', 'B', 'C']);
+$('text').onkeydown = e => { if (e.key === 'Enter') $('an').click(); };
+</script>
+</body>
+</html>

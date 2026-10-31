@@ -39,8 +39,24 @@ impl IntoResponse for AppError {
     }
 }
 
+const UI_HTML: &str = include_str!("ui/index.html");
+
+async fn ui_handler() -> axum::response::Html<&'static str> {
+    axum::response::Html(UI_HTML)
+}
+
 pub fn build_router(state: SharedState) -> Router {
-    Router::new()
+    build_router_with_ui(state, true)
+}
+
+/// `ui_enabled = false` disables the embedded web UI (`GET /_ui`).
+pub fn build_router_with_ui(state: SharedState, ui_enabled: bool) -> Router {
+    let router = if ui_enabled {
+        Router::new().route("/_ui", get(ui_handler))
+    } else {
+        Router::new()
+    };
+    router
         .route("/", get(root_handler))
         .route("/mcp", post(mcp_http_handler))
         .route("/_cluster/health", get(cluster_health_handler))

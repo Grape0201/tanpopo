@@ -560,3 +560,34 @@ async fn test_mcp_jsonrpc_endpoints() {
     let (_, res) = send_json(&app, Method::POST, "/mcp", call("get_document", json!({ "index": "nope", "id": "1" }))).await;
     assert_eq!(res["result"]["isError"], true);
 }
+
+#[tokio::test]
+async fn test_web_ui_toggle() {
+    use tanpopo::server::build_router_with_ui;
+    let tmp_dir = TempDir::new().unwrap();
+    let dict = build_fallback_dictionary().unwrap();
+    let mgr = Arc::new(IndexManager::new(tmp_dir.path().to_path_buf(), dict, 15_000_000).unwrap());
+
+    let get_ui = |app: axum::Router| async move {
+        let req = Request::builder().uri("/_ui").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        let body = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        (status, ct, body)
+    };
+
+    let (status, ct, body) = get_ui(build_router(mgr.clone())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(ct.starts_with("text/html"));
+    assert!(body.contains("<title>Tanpopo UI</title>"));
+
+    // Disabled: "/_ui" falls through to the "/{index}" handler (index not found).
+    let (status, _, body) = get_ui(build_router_with_ui(mgr, false)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(!body.contains("<title>Tanpopo UI</title>"));
+}

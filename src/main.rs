@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tanpopo::index::IndexManager;
-use tanpopo::server::build_router;
+use tanpopo::server::build_router_with_ui;
 use tanpopo::tokenizer::load_dictionary_from_dir;
 use tracing_subscriber::EnvFilter;
 
@@ -34,7 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if mcp_stdio {
         return Ok(tokio::task::spawn_blocking(move || tanpopo::mcp::run_stdio_loop(mgr)).await??);
     }
-    let app = build_router(mgr);
+    let ui_enabled = !env::var("TANPOPO_UI").is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"));
+    let app = build_router_with_ui(mgr, ui_enabled);
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!(
@@ -43,6 +44,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         data_dir.display(),
         writer_heap_bytes / 1_000_000
     );
+    if ui_enabled {
+        tracing::info!("Web UI: http://{}/_ui", bind_addr);
+    }
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
