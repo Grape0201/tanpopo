@@ -2,15 +2,17 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use tanpopo::engine::HybridManager;
 use tanpopo::index::IndexManager;
 use tanpopo::server::build_router_with_ui;
 use tanpopo::tokenizer::load_dictionary_from_dir;
+use tanpopo::vector::{EmbedConfig, Embedder, HttpEmbedder};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mcp_stdio = env::args().any(|a| a == "--mcp") || env::var("TANPOPO_MCP_STDIO").is_ok_and(|v| v == "1");
-    // stdout is reserved for JSON-RPC in stdio mode
+    let mcp_stdio =
+        env::args().any(|a| a == "--mcp") || env::var("TANPOPO_MCP_STDIO").is_ok_and(|v| v == "1");
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -30,12 +32,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(15_000_000);
 
     let dict = load_dictionary_from_dir(dict_dir.as_deref(), dict_path.as_deref())?;
-    let mgr = Arc::new(IndexManager::new(data_dir.clone(), dict, writer_heap_bytes)?);
+    let bm25_mgr = Arc::new(IndexManager::new(data_dir.clone(), dict, writer_heap_bytes)?);
+
+    let embedder: Option<Arc<dyn Embedder>> = EmbedConfig::from_env().map(|cfg| {
+        tracing::info!(
+            "Hybrid search enabled: embed_url={} model={} preset={:?}",
+            cfg.url,
+            cfg.model,
+            cfg.preset
+        );
+        Arc::new(HttpEmbedder::new(cfg)) as Arc<dyn Embedder>
+    });
+
+    let hybrid_mgr = Arc::new(HybridManager::new(bm25_mgr, embedder)?);
+
     if mcp_stdio {
-        return Ok(tokio::task::spawn_blocking(move || tanpopo::mcp::run_stdio_loop(mgr)).await??);
+        return Ok(
+            tokio::task::spawn_blocking(move || tanpopo::mcp::run_stdio_loop(hybrid_mgr)).await??,
+        );
     }
-    let ui_enabled = !env::var("TANPOPO_UI").is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"));
-    let app = build_router_with_ui(mgr, ui_enabled);
+
+    let ui_enabled =
+        !env::var("TANPOPO_UI").is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"));
+    let app = build_router_with_ui(hybrid_mgr, ui_enabled);
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!(

@@ -1,0 +1,19 @@
+[package]
+name = "tanpopo-vector"
+version.workspace = true
+edition.workspace = true
+description = "Lightweight mmap-backed SQ8 vector store, line-aware chunker, and HTTP embedding client for Tanpopo"
+
+[dependencies]
+async-trait = { workspace = true }
+memmap2 = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+tempfile = { workspace = true }

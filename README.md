@@ -3,6 +3,12 @@
 Tanpopo (たんぽぽ / Dandelion) is a lightweight, memory-efficient Japanese full-text search server built on top of [Tantivy](https://github.com/quickwit-oss/tantivy) and [Sudachi.rs](https://github.com/WorksApplications/sudachi.rs).
 Just as Tantivy takes inspiration from the French word for dandelion, Tanpopo brings that same blazing speed to Japanese text search with a feather-light memory footprint and an Elasticsearch-compatible REST API subset.
 
+## Workspace Structure
+
+- **`crates/tanpopo`**: Hybrid search server & MCP orchestrating `tanpopo-bm25` and `tanpopo-vector` with Reciprocal Rank Fusion (RRF) and Linear Combination.
+- **`crates/tanpopo-bm25`**: Standalone Japanese BM25 full-text search engine (Sudachi.rs + Tantivy). Can be run independently via `cargo run --release -p tanpopo-bm25`.
+- **`crates/tanpopo-vector`**: Lightweight `mmap` SQ8 (`i8`) vector store with parallel SIMD dot-product, line-aware Markdown chunker (`[start_line, end_line]`), MaxP document aggregation, and OpenAI-compatible `/v1/embeddings` client (`ruri` / `gemma` native prefixes).
+
 ## Features
 
 - **Low Memory Footprint**:
@@ -51,10 +57,12 @@ TANPOPO_BIND="127.0.0.1:9200" \
 TANPOPO_DATA_DIR="./data" \
 TANPOPO_SUDACHI_DICT_DIR="./resources" \
 TANPOPO_WRITER_HEAP_BYTES="15000000" \
-cargo run --release
+TANPOPO_EMBED_URL="http://127.0.0.1:8080/v1/embeddings" \
+TANPOPO_EMBED_MODEL="cl-nagoya/ruri-v3-310m" \
+cargo run --release -p tanpopo
 ```
 
-> **Note**: For backward compatibility, `TANPOPO_DICT_PATH="./resources/system.dic"` can still be used to specify an explicit system dictionary file.
+> **Note**: Omit `TANPOPO_EMBED_URL` (or run `cargo run --release -p tanpopo-bm25`) for pure BM25 mode. For backward compatibility, `TANPOPO_DICT_PATH="./resources/system.dic"` can still be used to specify an explicit system dictionary file.
 
 ### 3. API Examples
 
@@ -108,7 +116,7 @@ curl -X POST http://localhost:9200/articles/_search \
 
 ## MCP (Model Context Protocol)
 
-Tanpopo is an MCP server for agentic search. Tools: `list_indices`, `search`, `get_document`, `analyze_text`.
+Tanpopo is an MCP server for agentic search. Tools: `list_indices`, `search` (with line-numbered Sudachi highlights, `_source` truncation/filtering, `minimum_should_match`, and token diagnostics), `get_document` (with `start_line`/`end_line`, `offset`/`length`, and `outline`), `search_in_document` (in-document grep with Sudachi normalization), `analyze_text`.
 
 - HTTP: `POST http://localhost:9200/mcp` (JSON-RPC 2.0)
 - stdio: `tanpopo --mcp` (or `TANPOPO_MCP_STDIO=1`; logs go to stderr)

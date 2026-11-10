@@ -600,6 +600,10 @@ impl IndexManager {
         Ok(mgr)
     }
 
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
     fn load_existing_indices(&self) -> Result<(), AppError> {
         let entries =
             std::fs::read_dir(&self.data_dir).map_err(|e| AppError::Internal(e.to_string()))?;

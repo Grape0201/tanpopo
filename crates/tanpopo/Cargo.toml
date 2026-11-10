@@ -1,0 +1,21 @@
+[package]
+name = "tanpopo"
+version.workspace = true
+edition.workspace = true
+description = "Hybrid Japanese search engine combining tanpopo-bm25 (Sudachi + Tantivy) and tanpopo-vector (Mmap SQ8 + RRF)"
+
+[dependencies]
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sudachi = { workspace = true }
+tanpopo-bm25 = { workspace = true }
+tanpopo-vector = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tower = { workspace = true }

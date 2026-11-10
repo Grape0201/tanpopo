@@ -3,9 +3,9 @@ use std::sync::Arc;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use serde_json::{Value, json};
-use tanpopo::index::IndexManager;
-use tanpopo::server::build_router;
-use tanpopo::tokenizer::{
+use tanpopo_bm25::index::IndexManager;
+use tanpopo_bm25::server::build_router;
+use tanpopo_bm25::tokenizer::{
     SplitMode, SudachiTokenizer, SudachiTokenizerConfig, TokenForm, build_fallback_dictionary,
     build_fallback_system_dic_bytes, discover_dictionaries, load_dictionary_from_dir,
 };
@@ -533,7 +533,7 @@ async fn test_mcp_jsonrpc_endpoints() {
     assert_eq!(status, StatusCode::ACCEPTED);
 
     let (_, res) = send_json(&app, Method::POST, "/mcp", rpc(1, "tools/list", json!({}))).await;
-    assert_eq!(res["result"]["tools"].as_array().unwrap().len(), 4);
+    assert_eq!(res["result"]["tools"].as_array().unwrap().len(), 5);
 
     let tool_text = |res: &Value| -> Value {
         assert_eq!(res["result"]["isError"], false, "{res}");
@@ -562,8 +562,267 @@ async fn test_mcp_jsonrpc_endpoints() {
 }
 
 #[tokio::test]
+async fn test_agentic_search_features_mcp_and_query() {
+    let tmp_dir = TempDir::new().unwrap();
+    let dict = build_fallback_dictionary().unwrap();
+    let mgr = Arc::new(IndexManager::new(tmp_dir.path().to_path_buf(), dict, 15_000_000).unwrap());
+    let app = build_router(mgr);
+
+    send_json(
+        &app,
+        Method::PUT,
+        "/docs",
+        Some(json!({
+            "mappings": {
+                "properties": {
+                    "title": { "type": "text", "analyzer": "sudachi_a" },
+                    "content": { "type": "text", "analyzer": "sudachi_a" },
+                    "category": { "type": "keyword" }
+                }
+            }
+        })),
+    )
+    .await;
+
+    let mut long_lines = vec![
+        "# 審査報告書".to_string(),
+        "1. はじめに".to_string(),
+        "本資料は関西国際空港および京都・大阪エリアの案内です。".to_string(),
+    ];
+    for i in 4..=30 {
+        long_lines.push(format!("ダミー段落 {i}: ここは長文テスト用のテキスト行です。文字数を増やすためのパディングを含みます。"));
+    }
+    long_lines.push("## 2. 観察と記録".to_string());
+    long_lines.push("蒲公英の観察記録をしょうゆと一緒に打込む手順について解説します。".to_string());
+    for i in 33..=45 {
+        long_lines.push(format!("付録行 {i}: 追加の補足説明テキストです。"));
+    }
+    let long_content = long_lines.join("\n");
+    assert!(long_content.chars().count() > 600);
+
+    send_json(
+        &app,
+        Method::PUT,
+        "/docs/_doc/doc1",
+        Some(json!({
+            "title": "蒲公英の観察レポート",
+            "category": "nature",
+            "content": long_content,
+        })),
+    )
+    .await;
+
+    send_json(
+        &app,
+        Method::PUT,
+        "/docs/_doc/doc2",
+        Some(json!({
+            "title": "関西国際空港のアクセス",
+            "category": "travel",
+            "content": "関西国際空港から大阪や京都へ行く鉄道の案内。",
+        })),
+    )
+    .await;
+
+    send_json(&app, Method::POST, "/docs/_refresh", None).await;
+
+    let rpc_call = |name: &str, args: Value| {
+        Some(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": args }
+        }))
+    };
+    let parse_tool = |res: &Value| -> Value {
+        assert_eq!(res["result"]["isError"], false, "{res}");
+        serde_json::from_str(res["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    };
+
+    // 1. MCP search: auto-truncates long content (>500 chars), returns Sudachi normalized highlight with line number [L32], and token diagnostics
+    let (_, res) = send_json(
+        &app,
+        Method::POST,
+        "/mcp",
+        rpc_call(
+            "search",
+            json!({
+                "index": "docs",
+                "q": "醤油 打ち込む"
+            }),
+        ),
+    )
+    .await;
+    let v = parse_tool(&res);
+    assert_eq!(v["hits"]["total"]["value"], 1);
+    let hit = &v["hits"]["hits"][0];
+    assert_eq!(hit["_id"], "doc1");
+
+    // Verify _source.content was truncated with total chars/lines metadata
+    let truncated_content = hit["_source"]["content"].as_str().unwrap();
+    assert!(
+        truncated_content.contains("... [truncated: total "),
+        "Expected truncated marker in: {truncated_content}"
+    );
+    assert!(truncated_content.contains("45 lines]"));
+
+    // Verify highlight matched normalized forms ("しょうゆ" for "醤油", "打込む" for "打ち込む") and includes [L32]
+    let hl_arr = hit["highlight"]["content"].as_array().unwrap();
+    assert!(!hl_arr.is_empty());
+    let snippet = hl_arr[0].as_str().unwrap();
+    assert!(snippet.starts_with("[L32]"), "Expected [L32] prefix in snippet: {snippet}");
+    assert!(snippet.contains("<em>しょうゆ</em>"), "Expected highlighted しょうゆ in: {snippet}");
+    assert!(snippet.contains("<em>打込む</em>"), "Expected highlighted 打込む in: {snippet}");
+
+    // Verify diagnostics.query_tokens has doc_freq
+    let diag_tokens = v["diagnostics"]["query_tokens"].as_array().unwrap();
+    assert!(!diag_tokens.is_empty());
+
+    // 2. MCP search: exclude_fields & fields filtering
+    let (_, res) = send_json(
+        &app,
+        Method::POST,
+        "/mcp",
+        rpc_call(
+            "search",
+            json!({
+                "index": "docs",
+                "q": "関西国際空港",
+                "exclude_fields": ["content"]
+            }),
+        ),
+    )
+    .await;
+    let v = parse_tool(&res);
+    assert!(v["hits"]["hits"][0]["_source"]["content"].is_null());
+    assert!(v["hits"]["hits"][0]["_source"]["title"].is_string());
+
+    // 3. get_document with outline=true
+    let (_, res) = send_json(
+        &app,
+        Method::POST,
+        "/mcp",
+        rpc_call(
+            "get_document",
+            json!({
+                "index": "docs",
+                "id": "doc1",
+                "outline": true
+            }),
+        ),
+    )
+    .await;
+    let v = parse_tool(&res);
+    assert_eq!(v["outline"]["field"], "content");
+    assert_eq!(v["outline"]["total_lines"], 45);
+    let headings = v["outline"]["headings"].as_array().unwrap();
+    assert_eq!(headings.len(), 3);
+    assert_eq!(headings[0]["line"], 1);
+    assert_eq!(headings[0]["heading"], "# 審査報告書");
+    assert_eq!(headings[1]["line"], 2);
+    assert_eq!(headings[1]["heading"], "1. はじめに");
+    assert_eq!(headings[2]["line"], 31);
+    assert_eq!(headings[2]["heading"], "## 2. 観察と記録");
+    // Full content is omitted from _source when outline is requested
+    assert!(v["_source"]["content"].is_null());
+
+    // 4. get_document with start_line / end_line
+    let (_, res) = send_json(
+        &app,
+        Method::POST,
+        "/mcp",
+        rpc_call(
+            "get_document",
+            json!({
+                "index": "docs",
+                "id": "doc1",
+                "start_line": 31,
+                "end_line": 32
+            }),
+        ),
+    )
+    .await;
+    let v = parse_tool(&res);
+    assert_eq!(v["slice"]["start_line"], 31);
+    assert_eq!(v["slice"]["end_line"], 32);
+    let slice_text = v["slice"]["content"].as_str().unwrap();
+    assert!(slice_text.contains("31: ## 2. 観察と記録"));
+    assert!(slice_text.contains("32: 蒲公英の観察記録をしょうゆと一緒に打込む"));
+
+    // 5. search_in_document (grep inside a single document with Sudachi normalization)
+    let (_, res) = send_json(
+        &app,
+        Method::POST,
+        "/mcp",
+        rpc_call(
+            "search_in_document",
+            json!({
+                "index": "docs",
+                "id": "doc1",
+                "field": "content",
+                "query": "タンポポ 打ち込む",
+                "context_lines": 1
+            }),
+        ),
+    )
+    .await;
+    let v = parse_tool(&res);
+    assert_eq!(v["total_matches"], 1);
+    let m = &v["matches"][0];
+    assert_eq!(m["start_line"], 31);
+    assert_eq!(m["end_line"], 33);
+    assert_eq!(m["match_lines"], json!([32]));
+    let grep_snippet = m["snippet"].as_str().unwrap();
+    assert!(grep_snippet.contains("32: <em>蒲公英</em>の観察記録をしょうゆと一緒に<em>打込む</em>"));
+
+    // 6. minimum_should_match, field^boost, and 0-hit diagnostics
+    // Both doc1 and doc2 mention "関西", "国際", "空港", "大阪", "京都", but if we search 4 tokens:
+    // "関西 空港 醤油 東京" -> 3 of 4 match doc1 ("関西", "空港", "醤油"), only 2 of 4 match doc2 ("関西", "空港")
+    let (_, res) = send_json(
+        &app,
+        Method::POST,
+        "/mcp",
+        rpc_call(
+            "search",
+            json!({
+                "index": "docs",
+                "q": "関西 空港 醤油 東京",
+                "minimum_should_match": "75%"
+            }),
+        ),
+    )
+    .await;
+    let v = parse_tool(&res);
+    assert_eq!(v["hits"]["total"]["value"], 1);
+    assert_eq!(v["hits"]["hits"][0]["_id"], "doc1");
+
+    // Field boost: "関西国際空港" is in doc2's title AND doc1's content; boosting title^5 ranks doc2 first
+    let (_, res) = send_json(
+        &app,
+        Method::POST,
+        "/mcp",
+        rpc_call(
+            "search",
+            json!({
+                "index": "docs",
+                "query": {
+                    "multi_match": {
+                        "query": "関西国際空港",
+                        "fields": ["title^5", "content"]
+                    }
+                }
+            }),
+        ),
+    )
+    .await;
+    let v = parse_tool(&res);
+    assert_eq!(v["hits"]["total"]["value"], 2);
+    assert_eq!(v["hits"]["hits"][0]["_id"], "doc2");
+}
+
+#[tokio::test]
 async fn test_web_ui_toggle() {
-    use tanpopo::server::build_router_with_ui;
+    use tanpopo_bm25::server::build_router_with_ui;
     let tmp_dir = TempDir::new().unwrap();
     let dict = build_fallback_dictionary().unwrap();
     let mgr = Arc::new(IndexManager::new(tmp_dir.path().to_path_buf(), dict, 15_000_000).unwrap());
