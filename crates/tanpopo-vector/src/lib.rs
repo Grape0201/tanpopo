@@ -1,10 +1,10 @@
-pub mod chunker;
+pub mod doc_text;
 pub mod embed;
 pub mod store;
 
-pub use chunker::{ChunkConfig, TextChunk, chunk_document_json, chunk_text_by_lines};
+pub use doc_text::{DocText, doc_representative_text};
 pub use embed::{EmbedConfig, EmbedPreset, Embedder, HttpEmbedder};
-pub use store::{ChunkVectorInput, MmapVectorStore, VectorHit};
+pub use store::{MmapVectorStore, VectorHit};
 
 use thiserror::Error;
 

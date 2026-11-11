@@ -7,7 +7,7 @@ Just as Tantivy takes inspiration from the French word for dandelion, Tanpopo br
 
 - **`crates/tanpopo`**: Hybrid search server & MCP orchestrating `tanpopo-bm25` and `tanpopo-vector` with Reciprocal Rank Fusion (RRF) and Linear Combination.
 - **`crates/tanpopo-bm25`**: Standalone Japanese BM25 full-text search engine (Sudachi.rs + Tantivy). Can be run independently via `cargo run --release -p tanpopo-bm25`.
-- **`crates/tanpopo-vector`**: Lightweight `mmap` SQ8 (`i8`) vector store with parallel SIMD dot-product, line-aware Markdown chunker (`[start_line, end_line]`), MaxP document aggregation, and OpenAI-compatible `/v1/embeddings` client (`ruri` / `gemma` native prefixes).
+- **`crates/tanpopo-vector`**: Lightweight `mmap` SQ8 (`i8`) vector store with parallel SIMD dot-product (1 document = 1 vector, embedded from `title` + `summary`, or the first `TANPOPO_DOC_EMBED_CHARS` (default 4000) characters of `content`/`body`), and OpenAI-compatible `/v1/embeddings` client (`ruri` / `gemma` native prefixes). Vector stores from older chunk-based versions must be deleted and re-indexed.
 
 ## Features
 

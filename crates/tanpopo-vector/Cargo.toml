@@ -2,7 +2,7 @@
 name = "tanpopo-vector"
 version.workspace = true
 edition.workspace = true
-description = "Lightweight mmap-backed SQ8 vector store, line-aware chunker, and HTTP embedding client for Tanpopo"
+description = "Lightweight mmap-backed SQ8 vector store, and HTTP embedding client for Tanpopo"
 
 [dependencies]
 async-trait = { workspace = true }

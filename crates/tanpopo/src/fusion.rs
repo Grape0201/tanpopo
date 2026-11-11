@@ -72,8 +72,6 @@ pub struct RankedCandidate {
     pub index_name: String,
     pub doc_id: String,
     pub score: f32,
-    pub start_line: u32,
-    pub end_line: u32,
     pub bm25_hit: Option<Value>,
 }
 
@@ -86,7 +84,6 @@ pub struct FusedCandidate {
     pub bm25_score: Option<f32>,
     pub vector_rank: Option<usize>,
     pub vector_score: Option<f32>,
-    pub matched_lines: Option<(u32, u32)>,
     pub bm25_hit: Option<Value>,
 }
 
@@ -111,7 +108,6 @@ pub fn reciprocal_rank_fusion(
             bm25_score: None,
             vector_rank: None,
             vector_score: None,
-            matched_lines: None,
             bm25_hit: c.bm25_hit.clone(),
         });
         entry.fused_score += rrf_score;
@@ -134,15 +130,11 @@ pub fn reciprocal_rank_fusion(
             bm25_score: None,
             vector_rank: None,
             vector_score: None,
-            matched_lines: None,
             bm25_hit: None,
         });
         entry.fused_score += rrf_score;
         entry.vector_rank = Some(rank);
         entry.vector_score = Some(c.score);
-        if c.start_line > 0 {
-            entry.matched_lines = Some((c.start_line, c.end_line.max(c.start_line)));
-        }
     }
 
     let mut out: Vec<FusedCandidate> = map.into_values().collect();
@@ -180,7 +172,6 @@ pub fn linear_combination_fusion(
             bm25_score: None,
             vector_rank: None,
             vector_score: None,
-            matched_lines: None,
             bm25_hit: c.bm25_hit.clone(),
         });
         entry.fused_score += alpha * (norm as f64);
@@ -198,15 +189,11 @@ pub fn linear_combination_fusion(
             bm25_score: None,
             vector_rank: None,
             vector_score: None,
-            matched_lines: None,
             bm25_hit: None,
         });
         entry.fused_score += beta * (norm as f64);
         entry.vector_rank = Some(idx + 1);
         entry.vector_score = Some(c.score);
-        if c.start_line > 0 {
-            entry.matched_lines = Some((c.start_line, c.end_line.max(c.start_line)));
-        }
     }
 
     let mut out: Vec<FusedCandidate> = map.into_values().collect();

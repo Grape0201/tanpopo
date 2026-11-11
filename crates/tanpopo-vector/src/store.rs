@@ -10,39 +10,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Result, VectorError};
 
-const META_MAGIC: &[u8; 4] = b"TPV1";
+const META_MAGIC: &[u8; 4] = b"TPV2";
 const VEC_FILENAME: &str = "vectors.sq8";
 const META_FILENAME: &str = "vectors.meta";
 
-/// A single chunk vector to insert for a document.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChunkVectorInput {
-    pub vector: Vec<f32>,
-    /// 1-based start line in the document (`0` if whole-document).
-    #[serde(default)]
-    pub start_line: u32,
-    /// 1-based end line in the document (`0` if whole-document).
-    #[serde(default)]
-    pub end_line: u32,
-}
-
-/// A document-level hit returned by `MmapVectorStore::search` after MaxP chunk aggregation.
+/// A document-level hit returned by `MmapVectorStore::search`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorHit {
     pub doc_id: String,
     pub score: f32,
-    /// Start line of the best-matching chunk (0 if not chunked).
-    pub start_line: u32,
-    /// End line of the best-matching chunk (0 if not chunked).
-    pub end_line: u32,
 }
 
-/// Compact 16-byte in-memory descriptor per vector slot.
 #[derive(Debug, Clone, Copy)]
 struct SlotMeta {
     doc_idx: u32,
-    start_line: u32,
-    end_line: u32,
     deleted: bool,
 }
 
@@ -55,16 +36,15 @@ struct StoreInner {
     slots: Vec<SlotMeta>,
     doc_ids: Vec<String>,
     doc_to_idx: HashMap<String, u32>,
-    doc_slots: Vec<Vec<u32>>,
+    /// Active slot per document (`None` if the document has no live vector).
+    doc_slot: Vec<Option<u32>>,
     active_slots: usize,
 }
 
 /// Disk-backed `mmap` vector store using per-vector symmetric `SQ8` (`i8` + `f32` scale) quantization.
 ///
-/// - **Memory Footprint**: Vector payloads stay in OS page cache via `memmap2::Mmap` (`0` bytes on heap).
-///   Per-slot RAM metadata is only 16 bytes (~4.8 MB for 300,000 vectors).
-/// - **Throughput**: Parallel `rayon` + 8-lane unrolled `i8 -> i32` SIMD dot product.
-/// - **Granularity**: Supports 1-to-N chunk vectors per document and aggregates via **MaxP** at search time.
+/// One document = one vector. Vector payloads stay in OS page cache via `memmap2::Mmap`;
+/// search is a parallel `rayon` + unrolled `i8 -> i32` dot product over all live slots.
 pub struct MmapVectorStore {
     dir_path: PathBuf,
     inner: RwLock<StoreInner>,
@@ -100,7 +80,7 @@ impl MmapVectorStore {
             slots: Vec::new(),
             doc_ids: Vec::new(),
             doc_to_idx: HashMap::new(),
-            doc_slots: Vec::new(),
+            doc_slot: Vec::new(),
             active_slots: 0,
         };
 
@@ -115,24 +95,18 @@ impl MmapVectorStore {
         self.inner.read().map(|g| g.dim).unwrap_or(0)
     }
 
-    pub fn active_vector_count(&self) -> usize {
+    /// Number of documents that currently have a live vector.
+    pub fn active_doc_count(&self) -> usize {
         self.inner.read().map(|g| g.active_slots).unwrap_or(0)
     }
 
-    pub fn active_doc_count(&self) -> usize {
-        self.inner
-            .read()
-            .map(|g| g.doc_slots.iter().filter(|s| !s.is_empty()).count())
-            .unwrap_or(0)
+    /// Upsert the vector for a single document, tombstoning any previous vector for `doc_id`.
+    pub fn upsert_doc(&self, doc_id: &str, vector: &[f32]) -> Result<()> {
+        self.upsert_batch(&[(doc_id.to_string(), vector.to_vec())])
     }
 
-    /// Upsert chunk vectors for a single document, tombstoning any previous chunks for `doc_id`.
-    pub fn upsert_doc(&self, doc_id: &str, chunks: &[ChunkVectorInput]) -> Result<()> {
-        self.upsert_batch(&[(doc_id.to_string(), chunks.to_vec())])
-    }
-
-    /// Upsert chunk vectors for a batch of documents in a single disk flush & mmap reload.
-    pub fn upsert_batch(&self, batch: &[(String, Vec<ChunkVectorInput>)]) -> Result<()> {
+    /// Upsert vectors for a batch of documents in a single disk flush & mmap reload.
+    pub fn upsert_batch(&self, batch: &[(String, Vec<f32>)]) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
@@ -143,13 +117,13 @@ impl MmapVectorStore {
         guard.append_batch(batch)
     }
 
-    /// Tombstone all chunk vectors belonging to `doc_id`.
+    /// Tombstone the vector belonging to `doc_id`.
     pub fn delete_doc(&self, doc_id: &str) -> Result<bool> {
         let mut guard = self
             .inner
             .write()
             .map_err(|_| VectorError::Corrupted("poisoned lock".into()))?;
-        guard.mark_doc_deleted(doc_id, true)
+        guard.mark_doc_deleted(doc_id)
     }
 
     /// Compact `vectors.sq8` and `vectors.meta` if deleted slots exceed 30% (and at least 256 slots).
@@ -175,7 +149,7 @@ impl MmapVectorStore {
         guard.compact(&self.dir_path)
     }
 
-    /// Search for top-`limit` documents by maximum chunk cosine similarity (MaxP),
+    /// Search for top-`limit` documents by cosine similarity,
     /// optionally pre-filtered by `allowed_doc_ids`.
     pub fn search(
         &self,
@@ -213,148 +187,117 @@ impl MmapVectorStore {
             return Ok(Vec::new());
         }
 
-        // Fast path when pre-filter is selective: score only slots belonging to allowed_doc_ids!
-        if let Some(allowed) = allowed_doc_ids {
+        let mut scored: Vec<(f32, u32)> = if let Some(allowed) = allowed_doc_ids {
             if allowed.is_empty() {
                 return Ok(Vec::new());
             }
             if allowed.len() * 4 <= guard.doc_ids.len().max(1) {
-                let mut hits = Vec::with_capacity(allowed.len());
-                for doc_id in allowed {
-                    let Some(&doc_idx) = guard.doc_to_idx.get(doc_id.as_str()) else {
-                        continue;
-                    };
-                    let slots = &guard.doc_slots[doc_idx as usize];
-                    if slots.is_empty() {
-                        continue;
-                    }
-                    let mut best_score = f32::NEG_INFINITY;
-                    let mut best_span = (0u32, 0u32);
-                    for &slot_idx in slots {
-                        let slot = &guard.slots[slot_idx as usize];
-                        if slot.deleted {
-                            continue;
-                        }
+                // Selective filter: score only the allowed documents.
+                allowed
+                    .iter()
+                    .filter_map(|id| {
+                        let doc_idx = *guard.doc_to_idx.get(id.as_str())?;
+                        let slot_idx = guard.doc_slot[doc_idx as usize]?;
                         let score = score_slot(raw_bytes, slot_idx as usize, stride, dim, q_scale, &q_i8);
-                        if score > best_score {
-                            best_score = score;
-                            best_span = (slot.start_line, slot.end_line);
-                        }
-                    }
-                    if best_score > f32::NEG_INFINITY {
-                        hits.push(VectorHit {
-                            doc_id: doc_id.clone(),
-                            score: best_score,
-                            start_line: best_span.0,
-                            end_line: best_span.1,
-                        });
-                    }
-                }
-                hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-                hits.truncate(limit);
-                return Ok(hits);
-            }
-        }
-
-        // Build allowed doc_idx mask if a broader filter was supplied
-        let allowed_mask: Option<Vec<bool>> = allowed_doc_ids.map(|allowed| {
-            let mut mask = vec![false; guard.doc_ids.len()];
-            for id in allowed {
-                if let Some(&idx) = guard.doc_to_idx.get(id.as_str()) {
-                    mask[idx as usize] = true;
-                }
-            }
-            mask
-        });
-
-        let slots = &guard.slots;
-        let num_slots = slots.len();
-
-        // Parallel scan across mmap blocks when collection is non-trivial
-        let best_per_doc: HashMap<u32, (f32, u32, u32)> = if num_slots >= 2048 {
-            let chunk_size = 2048;
-            (0..num_slots.div_ceil(chunk_size))
-                .into_par_iter()
-                .map(|blk| {
-                    let start = blk * chunk_size;
-                    let end = (start + chunk_size).min(num_slots);
-                    let mut local: HashMap<u32, (f32, u32, u32)> = HashMap::new();
-                    for (slot_idx, slot) in slots[start..end].iter().enumerate() {
-                        if slot.deleted {
-                            continue;
-                        }
-                        if let Some(ref mask) = allowed_mask {
-                            if !mask[slot.doc_idx as usize] {
-                                continue;
-                            }
-                        }
-                        let abs_idx = start + slot_idx;
-                        let score = score_slot(raw_bytes, abs_idx, stride, dim, q_scale, &q_i8);
-                        local
-                            .entry(slot.doc_idx)
-                            .and_modify(|e| {
-                                if score > e.0 {
-                                    *e = (score, slot.start_line, slot.end_line);
-                                }
-                            })
-                            .or_insert((score, slot.start_line, slot.end_line));
-                    }
-                    local
-                })
-                .reduce(HashMap::new, |mut acc, map| {
-                    for (doc_idx, cand) in map {
-                        acc.entry(doc_idx)
-                            .and_modify(|e| {
-                                if cand.0 > e.0 {
-                                    *e = cand;
-                                }
-                            })
-                            .or_insert(cand);
-                    }
-                    acc
-                })
-        } else {
-            let mut map: HashMap<u32, (f32, u32, u32)> = HashMap::with_capacity(guard.doc_ids.len());
-            for (slot_idx, slot) in slots.iter().enumerate() {
-                if slot.deleted {
-                    continue;
-                }
-                if let Some(ref mask) = allowed_mask {
-                    if !mask[slot.doc_idx as usize] {
-                        continue;
-                    }
-                }
-                let score = score_slot(raw_bytes, slot_idx, stride, dim, q_scale, &q_i8);
-                map.entry(slot.doc_idx)
-                    .and_modify(|e| {
-                        if score > e.0 {
-                            *e = (score, slot.start_line, slot.end_line);
-                        }
+                        Some((score, doc_idx))
                     })
-                    .or_insert((score, slot.start_line, slot.end_line));
+                    .collect()
+            } else {
+                let mut mask = vec![false; guard.doc_ids.len()];
+                for id in allowed {
+                    if let Some(&idx) = guard.doc_to_idx.get(id.as_str()) {
+                        mask[idx as usize] = true;
+                    }
+                }
+                scan_slots(&guard.slots, raw_bytes, stride, dim, q_scale, &q_i8, Some(&mask))
             }
-            map
+        } else {
+            scan_slots(&guard.slots, raw_bytes, stride, dim, q_scale, &q_i8, None)
         };
 
-        let mut hits: Vec<VectorHit> = best_per_doc
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+        Ok(scored
             .into_iter()
-            .map(|(doc_idx, (score, start_line, end_line))| VectorHit {
+            .map(|(score, doc_idx)| VectorHit {
                 doc_id: guard.doc_ids[doc_idx as usize].clone(),
                 score,
-                start_line,
-                end_line,
             })
-            .collect();
+            .collect())
+    }
+}
 
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        hits.truncate(limit);
-        Ok(hits)
+/// Scores every live slot (optionally restricted by a per-doc mask); parallel for large stores.
+fn scan_slots(
+    slots: &[SlotMeta],
+    raw_bytes: &[u8],
+    stride: usize,
+    dim: usize,
+    q_scale: f32,
+    q_i8: &[i8],
+    mask: Option<&Vec<bool>>,
+) -> Vec<(f32, u32)> {
+    let score_one = |(slot_idx, slot): (usize, &SlotMeta)| -> Option<(f32, u32)> {
+        if slot.deleted || mask.is_some_and(|m| !m[slot.doc_idx as usize]) {
+            return None;
+        }
+        Some((
+            score_slot(raw_bytes, slot_idx, stride, dim, q_scale, q_i8),
+            slot.doc_idx,
+        ))
+    };
+    if slots.len() >= 2048 {
+        slots.par_iter().enumerate().filter_map(score_one).collect()
+    } else {
+        slots.iter().enumerate().filter_map(score_one).collect()
     }
 }
 
 impl StoreInner {
     fn compute_stride(dim: usize) -> usize {
         4 + ((dim + 3) & !3)
+    }
+
+    fn read_doc_id(reader: &mut impl Read) -> Result<String> {
+        let mut len_buf = [0u8; 2];
+        reader.read_exact(&mut len_buf)?;
+        let mut id_bytes = vec![0u8; u16::from_le_bytes(len_buf) as usize];
+        reader.read_exact(&mut id_bytes)?;
+        String::from_utf8(id_bytes).map_err(|e| VectorError::Corrupted(e.to_string()))
+    }
+
+    fn intern_doc_id(&mut self, doc_id: &str) -> u32 {
+        if let Some(&idx) = self.doc_to_idx.get(doc_id) {
+            return idx;
+        }
+        let idx = self.doc_ids.len() as u32;
+        self.doc_ids.push(doc_id.to_string());
+        self.doc_to_idx.insert(doc_id.to_string(), idx);
+        self.doc_slot.push(None);
+        idx
+    }
+
+    /// Tombstones the live slot of `doc_idx` in memory. Returns whether one existed.
+    fn tombstone_in_memory(&mut self, doc_idx: u32) -> bool {
+        let Some(slot_idx) = self.doc_slot[doc_idx as usize].take() else {
+            return false;
+        };
+        self.slots[slot_idx as usize].deleted = true;
+        self.active_slots = self.active_slots.saturating_sub(1);
+        true
+    }
+
+    /// Registers a new live slot for `doc_id`, replacing any previous one.
+    fn push_slot(&mut self, doc_id: &str) {
+        let doc_idx = self.intern_doc_id(doc_id);
+        self.tombstone_in_memory(doc_idx);
+        let slot_idx = self.slots.len() as u32;
+        self.slots.push(SlotMeta {
+            doc_idx,
+            deleted: false,
+        });
+        self.doc_slot[doc_idx as usize] = Some(slot_idx);
+        self.active_slots += 1;
     }
 
     fn load_existing(&mut self) -> Result<()> {
@@ -368,21 +311,16 @@ impl StoreInner {
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
         if &magic != META_MAGIC {
-            return Err(VectorError::Corrupted("invalid vectors.meta magic header".into()));
+            return Err(VectorError::Corrupted(
+                "invalid vectors.meta magic header (old chunk-based store? delete the vector files and re-index)".into(),
+            ));
         }
 
         let mut dim_buf = [0u8; 4];
         reader.read_exact(&mut dim_buf)?;
         let dim = u32::from_le_bytes(dim_buf) as usize;
-        self.dim = dim;
-        self.stride = Self::compute_stride(dim);
 
-        self.slots.clear();
-        self.doc_ids.clear();
-        self.doc_to_idx.clear();
-        self.doc_slots.clear();
-        self.active_slots = 0;
-
+        let mut records = Vec::new();
         loop {
             let mut tag = [0u8; 1];
             match reader.read_exact(&mut tag) {
@@ -390,56 +328,8 @@ impl StoreInner {
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(VectorError::Io(e)),
             }
-
             match tag[0] {
-                // Record type 1: New slot [1, start_line: u32, end_line: u32, id_len: u16, id_bytes]
-                1 => {
-                    let mut header = [0u8; 10];
-                    reader.read_exact(&mut header)?;
-                    let start_line = u32::from_le_bytes(header[0..4].try_into().unwrap());
-                    let end_line = u32::from_le_bytes(header[4..8].try_into().unwrap());
-                    let id_len = u16::from_le_bytes(header[8..10].try_into().unwrap()) as usize;
-                    let mut id_bytes = vec![0u8; id_len];
-                    reader.read_exact(&mut id_bytes)?;
-                    let doc_id = String::from_utf8(id_bytes)
-                        .map_err(|e| VectorError::Corrupted(e.to_string()))?;
-
-                    let doc_idx = intern_doc_id(
-                        &mut self.doc_ids,
-                        &mut self.doc_to_idx,
-                        &mut self.doc_slots,
-                        &doc_id,
-                    );
-                    let slot_idx = self.slots.len() as u32;
-                    self.slots.push(SlotMeta {
-                        doc_idx,
-                        start_line,
-                        end_line,
-                        deleted: false,
-                    });
-                    self.doc_slots[doc_idx as usize].push(slot_idx);
-                    self.active_slots += 1;
-                }
-                // Record type 2: Tombstone doc [2, id_len: u16, id_bytes]
-                2 => {
-                    let mut len_buf = [0u8; 2];
-                    reader.read_exact(&mut len_buf)?;
-                    let id_len = u16::from_le_bytes(len_buf) as usize;
-                    let mut id_bytes = vec![0u8; id_len];
-                    reader.read_exact(&mut id_bytes)?;
-                    let doc_id = String::from_utf8(id_bytes)
-                        .map_err(|e| VectorError::Corrupted(e.to_string()))?;
-                    if let Some(&doc_idx) = self.doc_to_idx.get(&doc_id) {
-                        for &slot_idx in &self.doc_slots[doc_idx as usize] {
-                            let s = &mut self.slots[slot_idx as usize];
-                            if !s.deleted {
-                                s.deleted = true;
-                                self.active_slots = self.active_slots.saturating_sub(1);
-                            }
-                        }
-                        self.doc_slots[doc_idx as usize].clear();
-                    }
-                }
+                1 | 2 => records.push((tag[0], Self::read_doc_id(&mut reader)?)),
                 other => {
                     return Err(VectorError::Corrupted(format!(
                         "unknown record tag {other} in vectors.meta"
@@ -447,10 +337,27 @@ impl StoreInner {
                 }
             }
         }
-
         drop(reader);
-        self.reload_mmap()?;
-        Ok(())
+
+        self.dim = dim;
+        self.stride = Self::compute_stride(dim);
+        self.slots.clear();
+        self.doc_ids.clear();
+        self.doc_to_idx.clear();
+        self.doc_slot.clear();
+        self.active_slots = 0;
+
+        for (tag, doc_id) in records {
+            if tag == 1 {
+                // Record type 1: new slot [1, id_len: u16, id_bytes]
+                self.push_slot(&doc_id);
+            } else if let Some(&doc_idx) = self.doc_to_idx.get(&doc_id) {
+                // Record type 2: tombstone doc [2, id_len: u16, id_bytes]
+                self.tombstone_in_memory(doc_idx);
+            }
+        }
+
+        self.reload_mmap()
     }
 
     fn ensure_initialized(&mut self, dim: usize) -> Result<()> {
@@ -470,21 +377,13 @@ impl StoreInner {
         Ok(())
     }
 
-    fn mark_doc_deleted(&mut self, doc_id: &str, flush_meta: bool) -> Result<bool> {
+    fn mark_doc_deleted(&mut self, doc_id: &str) -> Result<bool> {
         let Some(&doc_idx) = self.doc_to_idx.get(doc_id) else {
             return Ok(false);
         };
-        if self.doc_slots[doc_idx as usize].is_empty() {
+        if !self.tombstone_in_memory(doc_idx) {
             return Ok(false);
         }
-        for &slot_idx in &self.doc_slots[doc_idx as usize] {
-            let slot = &mut self.slots[slot_idx as usize];
-            if !slot.deleted {
-                slot.deleted = true;
-                self.active_slots = self.active_slots.saturating_sub(1);
-            }
-        }
-        self.doc_slots[doc_idx as usize].clear();
 
         let id_bytes = doc_id.as_bytes();
         self.meta_file.seek(SeekFrom::End(0))?;
@@ -492,22 +391,19 @@ impl StoreInner {
         self.meta_file
             .write_all(&(id_bytes.len() as u16).to_le_bytes())?;
         self.meta_file.write_all(id_bytes)?;
-        if flush_meta {
-            self.meta_file.flush()?;
-        }
+        self.meta_file.flush()?;
         Ok(true)
     }
 
-    fn append_batch(&mut self, batch: &[(String, Vec<ChunkVectorInput>)]) -> Result<()> {
-        let first_dim = batch
-            .iter()
-            .flat_map(|(_, chunks)| chunks.iter())
-            .map(|c| c.vector.len())
-            .find(|&d| d > 0);
-        let Some(dim) = first_dim else {
+    fn append_batch(&mut self, batch: &[(String, Vec<f32>)]) -> Result<()> {
+        let Some(dim) = batch.iter().map(|(_, v)| v.len()).find(|&d| d > 0) else {
             return Ok(());
         };
         self.ensure_initialized(dim)?;
+        if batch.iter().any(|(_, v)| !v.is_empty() && v.len() != dim) {
+            let got = batch.iter().map(|(_, v)| v.len()).find(|&l| l != dim).unwrap_or(0);
+            return Err(VectorError::DimensionMismatch { expected: dim, got });
+        }
 
         self.vec_file.seek(SeekFrom::End(0))?;
         self.meta_file.seek(SeekFrom::End(0))?;
@@ -516,71 +412,25 @@ impl StoreInner {
         let mut vec_writer = BufWriter::new(&mut self.vec_file);
         let mut meta_writer = BufWriter::new(&mut self.meta_file);
         let mut row_buf = vec![0u8; stride];
+        let mut new_ids: Vec<&str> = Vec::with_capacity(batch.len());
 
-        for (doc_id, chunks) in batch {
-            for c in chunks {
-                if c.vector.len() != dim {
-                    return Err(VectorError::DimensionMismatch {
-                        expected: dim,
-                        got: c.vector.len(),
-                    });
-                }
+        for (doc_id, vector) in batch {
+            if vector.is_empty() {
+                continue;
             }
+            let (scale, q_vec) = quantize_l2_normalized(vector);
+            row_buf.fill(0);
+            row_buf[0..4].copy_from_slice(&scale.to_le_bytes());
+            let data_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(q_vec.as_ptr() as *const u8, dim) };
+            row_buf[4..4 + dim].copy_from_slice(data_bytes);
+            vec_writer.write_all(&row_buf)?;
 
-            // If doc already had chunks, tombstone them first
-            if let Some(&doc_idx) = self.doc_to_idx.get(doc_id.as_str()) {
-                if !self.doc_slots[doc_idx as usize].is_empty() {
-                    for &slot_idx in &self.doc_slots[doc_idx as usize] {
-                        let slot = &mut self.slots[slot_idx as usize];
-                        if !slot.deleted {
-                            slot.deleted = true;
-                            self.active_slots = self.active_slots.saturating_sub(1);
-                        }
-                    }
-                    self.doc_slots[doc_idx as usize].clear();
-                    let id_bytes = doc_id.as_bytes();
-                    meta_writer.write_all(&[2u8])?;
-                    meta_writer.write_all(&(id_bytes.len() as u16).to_le_bytes())?;
-                    meta_writer.write_all(id_bytes)?;
-                }
-            }
-
-            let doc_idx = intern_doc_id(
-                &mut self.doc_ids,
-                &mut self.doc_to_idx,
-                &mut self.doc_slots,
-                doc_id,
-            );
             let id_bytes = doc_id.as_bytes();
-
-            for chunk in chunks {
-                if chunk.vector.is_empty() {
-                    continue;
-                }
-                let (scale, q_vec) = quantize_l2_normalized(&chunk.vector);
-                row_buf.fill(0);
-                row_buf[0..4].copy_from_slice(&scale.to_le_bytes());
-                let data_bytes: &[u8] =
-                    unsafe { std::slice::from_raw_parts(q_vec.as_ptr() as *const u8, dim) };
-                row_buf[4..4 + dim].copy_from_slice(data_bytes);
-                vec_writer.write_all(&row_buf)?;
-
-                meta_writer.write_all(&[1u8])?;
-                meta_writer.write_all(&chunk.start_line.to_le_bytes())?;
-                meta_writer.write_all(&chunk.end_line.to_le_bytes())?;
-                meta_writer.write_all(&(id_bytes.len() as u16).to_le_bytes())?;
-                meta_writer.write_all(id_bytes)?;
-
-                let slot_idx = self.slots.len() as u32;
-                self.slots.push(SlotMeta {
-                    doc_idx,
-                    start_line: chunk.start_line,
-                    end_line: chunk.end_line,
-                    deleted: false,
-                });
-                self.doc_slots[doc_idx as usize].push(slot_idx);
-                self.active_slots += 1;
-            }
+            meta_writer.write_all(&[1u8])?;
+            meta_writer.write_all(&(id_bytes.len() as u16).to_le_bytes())?;
+            meta_writer.write_all(id_bytes)?;
+            new_ids.push(doc_id.as_str());
         }
 
         vec_writer.flush()?;
@@ -588,8 +438,12 @@ impl StoreInner {
         drop(vec_writer);
         drop(meta_writer);
 
-        self.reload_mmap()?;
-        Ok(())
+        // Replaying order matches the on-disk record order (later record replaces earlier one).
+        for id in new_ids {
+            self.push_slot(id);
+        }
+
+        self.reload_mmap()
     }
 
     fn reload_mmap(&mut self) -> Result<()> {
@@ -616,17 +470,13 @@ impl StoreInner {
         let tmp_vec_path = dir_path.join("vectors.sq8.tmp");
         let tmp_meta_path = dir_path.join("vectors.meta.tmp");
 
+        let mut live: Vec<String> = Vec::with_capacity(self.active_slots);
         {
             let mut tmp_vec = BufWriter::new(File::create(&tmp_vec_path)?);
             let mut tmp_meta = BufWriter::new(File::create(&tmp_meta_path)?);
 
             tmp_meta.write_all(META_MAGIC)?;
             tmp_meta.write_all(&(self.dim as u32).to_le_bytes())?;
-
-            let mut new_slots = Vec::with_capacity(self.active_slots);
-            let mut new_doc_ids = Vec::new();
-            let mut new_doc_to_idx: HashMap<String, u32> = HashMap::new();
-            let mut new_doc_slots: Vec<Vec<u32>> = Vec::new();
 
             if let Some(ref mmap) = self.mmap {
                 let raw = mmap.as_ref();
@@ -636,45 +486,28 @@ impl StoreInner {
                         continue;
                     }
                     let doc_id = &self.doc_ids[slot.doc_idx as usize];
-                    let new_doc_idx = if let Some(&idx) = new_doc_to_idx.get(doc_id) {
-                        idx
-                    } else {
-                        let idx = new_doc_ids.len() as u32;
-                        new_doc_ids.push(doc_id.clone());
-                        new_doc_to_idx.insert(doc_id.clone(), idx);
-                        new_doc_slots.push(Vec::new());
-                        idx
-                    };
-
                     let byte_offset = old_idx * stride;
                     tmp_vec.write_all(&raw[byte_offset..byte_offset + stride])?;
 
                     let id_bytes = doc_id.as_bytes();
                     tmp_meta.write_all(&[1u8])?;
-                    tmp_meta.write_all(&slot.start_line.to_le_bytes())?;
-                    tmp_meta.write_all(&slot.end_line.to_le_bytes())?;
                     tmp_meta.write_all(&(id_bytes.len() as u16).to_le_bytes())?;
                     tmp_meta.write_all(id_bytes)?;
-
-                    let new_slot_idx = new_slots.len() as u32;
-                    new_slots.push(SlotMeta {
-                        doc_idx: new_doc_idx,
-                        start_line: slot.start_line,
-                        end_line: slot.end_line,
-                        deleted: false,
-                    });
-                    new_doc_slots[new_doc_idx as usize].push(new_slot_idx);
+                    live.push(doc_id.clone());
                 }
             }
 
             tmp_vec.flush()?;
             tmp_meta.flush()?;
+        }
 
-            self.slots = new_slots;
-            self.doc_ids = new_doc_ids;
-            self.doc_to_idx = new_doc_to_idx;
-            self.doc_slots = new_doc_slots;
-            self.active_slots = self.slots.len();
+        self.slots.clear();
+        self.doc_ids.clear();
+        self.doc_to_idx.clear();
+        self.doc_slot.clear();
+        self.active_slots = 0;
+        for id in &live {
+            self.push_slot(id);
         }
 
         self.mmap = None;
@@ -685,28 +518,11 @@ impl StoreInner {
 
         self.vec_file = OpenOptions::new().read(true).write(true).open(&vec_path)?;
         self.meta_file = OpenOptions::new().read(true).write(true).open(&meta_path)?;
-        self.reload_mmap()?;
-        Ok(())
+        self.reload_mmap()
     }
 }
 
 /// L2-normalizes `v` and quantizes it into symmetric `SQ8` (`scale: f32`, `Vec<i8>`).
-fn intern_doc_id(
-    doc_ids: &mut Vec<String>,
-    doc_to_idx: &mut HashMap<String, u32>,
-    doc_slots: &mut Vec<Vec<u32>>,
-    doc_id: &str,
-) -> u32 {
-    if let Some(&idx) = doc_to_idx.get(doc_id) {
-        return idx;
-    }
-    let idx = doc_ids.len() as u32;
-    doc_ids.push(doc_id.to_string());
-    doc_to_idx.insert(doc_id.to_string(), idx);
-    doc_slots.push(Vec::new());
-    idx
-}
-
 fn quantize_l2_normalized(v: &[f32]) -> (f32, Vec<i8>) {
     let mut norm_sq = 0.0f32;
     for &x in v {

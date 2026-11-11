@@ -86,15 +86,14 @@ async fn call_tool(mgr: &HybridManager, name: &str, args: &Value) -> Result<Valu
             let indices = mgr.bm25().resolve_indices(pattern)?;
             let mut out = Vec::with_capacity(indices.len());
             for i in indices {
-                let (vec_docs, vec_chunks, vec_dim) = mgr
+                let (vec_docs, vec_dim) = mgr
                     .get_or_open_vector_store(&i.name)
-                    .map(|s| (s.active_doc_count(), s.active_vector_count(), s.dim()))
-                    .unwrap_or((0, 0, 0));
+                    .map(|s| (s.active_doc_count(), s.dim()))
+                    .unwrap_or((0, 0));
                 out.push(json!({
                     "index": i.name,
                     "docs_count": i.doc_count(),
                     "vector_docs_count": vec_docs,
-                    "vector_chunks_count": vec_chunks,
                     "vector_dim": vec_dim,
                     "settings": i.meta.settings,
                     "mappings": i.meta.mappings,

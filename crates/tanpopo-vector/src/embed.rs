@@ -7,8 +7,11 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::chunker::ChunkConfig;
+use crate::doc_text::DocText;
 use crate::{Result, VectorError};
+
+/// Default max body characters per document (fits embeddinggemma's 2048-token window).
+pub const DEFAULT_DOC_EMBED_CHARS: usize = 4000;
 
 /// Built-in prompt templates for Japanese / multilingual embedding models.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,7 +85,8 @@ pub struct EmbedConfig {
     pub api_key: Option<String>,
     pub preset: EmbedPreset,
     pub batch_size: usize,
-    pub chunk_config: ChunkConfig,
+    /// Max characters of document body embedded per document.
+    pub doc_embed_chars: usize,
 }
 
 impl EmbedConfig {
@@ -96,7 +100,7 @@ impl EmbedConfig {
             api_key: None,
             preset,
             batch_size: 32,
-            chunk_config: ChunkConfig::default(),
+            doc_embed_chars: DEFAULT_DOC_EMBED_CHARS,
         }
     }
 
@@ -134,15 +138,11 @@ impl EmbedConfig {
             .unwrap_or(32)
             .max(1);
 
-        let max_chars = env::var("TANPOPO_CHUNK_CHARS")
+        let doc_embed_chars = env::var("TANPOPO_DOC_EMBED_CHARS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(1000)
+            .unwrap_or(DEFAULT_DOC_EMBED_CHARS)
             .max(100);
-        let overlap_lines = env::var("TANPOPO_CHUNK_OVERLAP_LINES")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(3);
 
         Some(Self {
             url,
@@ -150,10 +150,7 @@ impl EmbedConfig {
             api_key,
             preset,
             batch_size,
-            chunk_config: ChunkConfig {
-                max_chars,
-                overlap_lines,
-            },
+            doc_embed_chars,
         })
     }
 }
@@ -161,9 +158,11 @@ impl EmbedConfig {
 #[async_trait]
 pub trait Embedder: Send + Sync {
     async fn embed_query(&self, query: &str) -> Result<Vec<f32>>;
-    async fn embed_passages(&self, title: Option<&str>, passages: &[String]) -> Result<Vec<Vec<f32>>>;
-    fn chunk_config(&self) -> ChunkConfig {
-        ChunkConfig::default()
+    /// Embeds one representative text per document (1 document = 1 vector), preserving order.
+    async fn embed_documents(&self, docs: &[DocText]) -> Result<Vec<Vec<f32>>>;
+    /// Max characters of document body fed to `embed_documents`.
+    fn doc_embed_chars(&self) -> usize {
+        DEFAULT_DOC_EMBED_CHARS
     }
 }
 
@@ -230,13 +229,13 @@ impl Embedder for HttpEmbedder {
             .ok_or_else(|| VectorError::Embed("empty embedding response".into()))
     }
 
-    async fn embed_passages(&self, title: Option<&str>, passages: &[String]) -> Result<Vec<Vec<f32>>> {
-        if passages.is_empty() {
+    async fn embed_documents(&self, docs: &[DocText]) -> Result<Vec<Vec<f32>>> {
+        if docs.is_empty() {
             return Ok(Vec::new());
         }
-        let formatted: Vec<String> = passages
+        let formatted: Vec<String> = docs
             .iter()
-            .map(|p| self.cfg.preset.format_passage(title, p))
+            .map(|d| self.cfg.preset.format_passage(d.title.as_deref(), &d.text))
             .collect();
 
         let mut all_vectors = Vec::with_capacity(formatted.len());
@@ -247,8 +246,8 @@ impl Embedder for HttpEmbedder {
         Ok(all_vectors)
     }
 
-    fn chunk_config(&self) -> ChunkConfig {
-        self.cfg.chunk_config
+    fn doc_embed_chars(&self) -> usize {
+        self.cfg.doc_embed_chars
     }
 }
 

@@ -96,6 +96,7 @@ pub fn build_router_with_ui(state: SharedState, ui_enabled: bool) -> Router {
             get(msearch_index_handler).post(msearch_index_handler),
         )
         .layer(axum::middleware::map_response(add_elastic_header))
+        .layer(axum::extract::DefaultBodyLimit::max(128 * 1024 * 1024))
         .with_state(state)
 }
 

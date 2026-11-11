@@ -66,6 +66,7 @@ pub fn build_router_with_ui(state: SharedState, ui_enabled: bool) -> Router {
             get(msearch_index_handler).post(msearch_index_handler),
         )
         .layer(axum::middleware::map_response(add_elastic_header))
+        .layer(axum::extract::DefaultBodyLimit::max(128 * 1024 * 1024))
         .with_state(state)
 }
 
@@ -126,7 +127,7 @@ async fn cat_indices_handler(State(mgr): State<SharedState>) -> Result<Json<Valu
     for item in &mut list {
         if let Some(name) = item.get("index").and_then(|v| v.as_str()).map(String::from) {
             if let Ok(store) = mgr.get_or_open_vector_store(&name) {
-                item["vectors.count"] = json!(store.active_vector_count());
+                item["vectors.count"] = json!(store.active_doc_count());
                 item["vectors.dim"] = json!(store.dim());
             }
         }
@@ -169,17 +170,16 @@ async fn get_index_handler(
     Path(index): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     let managed = mgr.bm25().get_index(&index)?;
-    let (vec_docs, vec_chunks, vec_dim) = mgr
+    let (vec_docs, vec_dim) = mgr
         .get_or_open_vector_store(&index)
-        .map(|s| (s.active_doc_count(), s.active_vector_count(), s.dim()))
-        .unwrap_or((0, 0, 0));
+        .map(|s| (s.active_doc_count(), s.dim()))
+        .unwrap_or((0, 0));
     Ok(Json(json!({
         index: {
             "settings": &managed.meta.settings,
             "mappings": &managed.meta.mappings,
             "docs_count": managed.doc_count(),
             "vector_docs_count": vec_docs,
-            "vector_chunks_count": vec_chunks,
             "vector_dim": vec_dim,
         }
     })))

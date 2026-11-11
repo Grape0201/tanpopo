@@ -2,15 +2,13 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use tanpopo_bm25::index::{AppError, CreateIndexRequest, IndexManager, ManagedIndex};
 use tanpopo_bm25::query::{
     SearchRequest, evaluate_filter_doc_ids, execute_search_arc, extract_search_text,
-    filter_and_truncate_source, format_span_snippet,
+    filter_and_truncate_source,
 };
-use tanpopo_vector::{
-    ChunkVectorInput, Embedder, MmapVectorStore, chunk_document_json,
-};
+use tanpopo_vector::{Embedder, MmapVectorStore, doc_representative_text};
 
 use crate::fusion::{
     FusedCandidate, FusionStrategy, RankedCandidate, linear_combination_fusion,
@@ -91,7 +89,7 @@ impl HybridManager {
     }
 
     /// Indexes a document into `tanpopo-bm25` and, if an `Embedder` is configured,
-    /// chunks the document by lines, embeds all chunks, and stores them in `MmapVectorStore`.
+    /// embeds the document as a single vector (title + summary / leading body) and stores it in `MmapVectorStore`.
     pub async fn index_document(
         &self,
         index_name: &str,
@@ -103,11 +101,13 @@ impl HybridManager {
         let (doc_id, created) = managed.index_document(id, doc_json.clone(), refresh)?;
 
         if let Some(ref embedder) = self.embedder {
-            let chunk_inputs = self.embed_single_doc(embedder.as_ref(), &doc_json).await?;
-            if !chunk_inputs.is_empty() {
+            let upserts = self
+                .embed_docs(embedder.as_ref(), vec![(doc_id.clone(), doc_json)])
+                .await?;
+            if !upserts.is_empty() {
                 let store = self.get_or_open_vector_store(index_name)?;
                 store
-                    .upsert_doc(&doc_id, &chunk_inputs)
+                    .upsert_batch(&upserts)
                     .map_err(|e| AppError::Internal(e.to_string()))?;
             }
         }
@@ -133,7 +133,7 @@ impl HybridManager {
     }
 
     /// Executes an Elasticsearch-compatible `_bulk` request across both BM25 and Vector stores.
-    /// Batches chunk embeddings across documents per index for high throughput.
+    /// Batches document embeddings per index for high throughput.
     pub async fn execute_bulk(
         &self,
         default_index: Option<&str>,
@@ -247,13 +247,7 @@ impl HybridManager {
 
         if let Some(ref embedder) = self.embedder {
             for (index_name, docs) in pending_docs_per_index {
-                let mut batch_upserts = Vec::with_capacity(docs.len());
-                for (doc_id, doc_val) in docs {
-                    let chunk_vecs = self.embed_single_doc(embedder.as_ref(), &doc_val).await?;
-                    if !chunk_vecs.is_empty() {
-                        batch_upserts.push((doc_id, chunk_vecs));
-                    }
-                }
+                let batch_upserts = self.embed_docs(embedder.as_ref(), docs).await?;
                 if !batch_upserts.is_empty() {
                     let store = self.get_or_open_vector_store(&index_name)?;
                     store
@@ -276,31 +270,26 @@ impl HybridManager {
         }))
     }
 
-    async fn embed_single_doc(
+    /// Embeds each document as one vector. Documents without usable text are skipped.
+    async fn embed_docs(
         &self,
         embedder: &dyn Embedder,
-        doc_json: &Value,
-    ) -> Result<Vec<ChunkVectorInput>, AppError> {
-        let (title, chunks) = chunk_document_json(doc_json, embedder.chunk_config());
-        if chunks.is_empty() {
-            return Ok(Vec::new());
+        docs: Vec<(String, Value)>,
+    ) -> Result<Vec<(String, Vec<f32>)>, AppError> {
+        let max_chars = embedder.doc_embed_chars();
+        let mut ids = Vec::with_capacity(docs.len());
+        let mut texts = Vec::with_capacity(docs.len());
+        for (id, doc) in docs {
+            if let Some(t) = doc_representative_text(&doc, max_chars) {
+                ids.push(id);
+                texts.push(t);
+            }
         }
-        let passages: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
         let vectors = embedder
-            .embed_passages(title.as_deref(), &passages)
+            .embed_documents(&texts)
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
-
-        let out = chunks
-            .into_iter()
-            .zip(vectors.into_iter())
-            .map(|(chunk, vector)| ChunkVectorInput {
-                vector,
-                start_line: chunk.start_line,
-                end_line: chunk.end_line,
-            })
-            .collect();
-        Ok(out)
+        Ok(ids.into_iter().zip(vectors).collect())
     }
 
     /// Executes a unified hybrid search across `tanpopo-bm25` and `MmapVectorStore`.
@@ -343,7 +332,7 @@ impl HybridManager {
         // Check if any target index actually has vectors
         let has_any_vectors = indices.iter().any(|idx| {
             self.get_or_open_vector_store(&idx.name)
-                .map(|s| s.active_vector_count() > 0)
+                .map(|s| s.active_doc_count() > 0)
                 .unwrap_or(false)
         });
 
@@ -384,7 +373,7 @@ impl HybridManager {
         let mut vector_candidates = Vec::new();
         for idx in &indices {
             let store = self.get_or_open_vector_store(&idx.name)?;
-            if store.active_vector_count() == 0 {
+            if store.active_doc_count() == 0 {
                 continue;
             }
             let filter_ids = evaluate_filter_doc_ids(idx, bm25_req.query.as_ref())?;
@@ -396,8 +385,6 @@ impl HybridManager {
                     index_name: idx.name.clone(),
                     doc_id: vh.doc_id,
                     score: vh.score,
-                    start_line: vh.start_line,
-                    end_line: vh.end_line,
                     bm25_hit: None,
                 });
             }
@@ -431,8 +418,6 @@ impl HybridManager {
                     bm25_score: None,
                     vector_rank: Some(i + 1),
                     vector_score: Some(c.score),
-                    matched_lines: (c.start_line > 0)
-                        .then_some((c.start_line, c.end_line.max(c.start_line))),
                     bm25_hit: None,
                 })
                 .collect(),
@@ -442,11 +427,6 @@ impl HybridManager {
         let max_score = fused_all.first().map(|f| f.fused_score);
         let index_map: BTreeMap<&str, &Arc<ManagedIndex>> =
             indices.iter().map(|i| (i.name.as_str(), i)).collect();
-        let highlight_enabled = bm25_req
-            .highlight
-            .as_ref()
-            .is_some_and(|v| v.as_bool().unwrap_or(true));
-
         let mut final_hits = Vec::new();
         for f in fused_all.into_iter().skip(from).take(size) {
             let mut hit_obj = if let Some(existing_hit) = f.bm25_hit {
@@ -463,17 +443,6 @@ impl HybridManager {
                     "_index": f.index_name,
                     "_id": f.doc_id,
                 });
-                if highlight_enabled {
-                    if let Some((start_l, end_l)) = f.matched_lines {
-                        if let Some((field_name, snippet)) =
-                            format_span_snippet(&raw_source, start_l, end_l, 240)
-                        {
-                            let mut hl_map = Map::new();
-                            hl_map.insert(field_name, json!([snippet]));
-                            h["highlight"] = Value::Object(hl_map);
-                        }
-                    }
-                }
                 if let Some(filtered_source) = filter_and_truncate_source(
                     &raw_source,
                     bm25_req.source.as_ref(),
@@ -485,30 +454,12 @@ impl HybridManager {
                 h
             };
 
-            // If BM25 hit didn't produce highlights but vector matched a line span, attach vector span snippet
-            if highlight_enabled && hit_obj.get("highlight").is_none() {
-                if let Some((start_l, end_l)) = f.matched_lines {
-                    if let Some(managed) = index_map.get(f.index_name.as_str()) {
-                        if let Ok(Some(raw_source)) = managed.get_document(&f.doc_id) {
-                            if let Some((field_name, snippet)) =
-                                format_span_snippet(&raw_source, start_l, end_l, 240)
-                            {
-                                let mut hl_map = Map::new();
-                                hl_map.insert(field_name, json!([snippet]));
-                                hit_obj["highlight"] = Value::Object(hl_map);
-                            }
-                        }
-                    }
-                }
-            }
-
             hit_obj["_score"] = json!(f.fused_score);
             hit_obj["_hybrid"] = json!({
                 "bm25_rank": f.bm25_rank,
                 "bm25_score": f.bm25_score,
                 "vector_rank": f.vector_rank,
                 "vector_score": f.vector_score,
-                "matched_lines": f.matched_lines.map(|(s, e)| vec![s, e]),
             });
             final_hits.push(hit_obj);
         }
@@ -554,8 +505,6 @@ fn extract_bm25_candidates(resp: &Value) -> Vec<RankedCandidate> {
             index_name,
             doc_id,
             score,
-            start_line: 0,
-            end_line: 0,
             bm25_hit: Some(hit.clone()),
         });
     }

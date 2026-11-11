@@ -5,37 +5,25 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{Value, json};
 use tanpopo_vector::{
-    ChunkConfig, ChunkVectorInput, EmbedConfig, EmbedPreset, Embedder, HttpEmbedder,
-    MmapVectorStore, chunk_document_json, chunk_text_by_lines,
+    DocText, EmbedPreset, EmbedConfig, Embedder, HttpEmbedder, MmapVectorStore,
+    doc_representative_text,
 };
 use tempfile::TempDir;
 
 #[test]
-fn test_line_aware_chunking() {
-    let md = "\
-# 第1章 概要
-関西国際空港は大阪湾の人工島に建設された空港です。
-24時間運用可能な国際拠点空港として機能しています。
-
-# 第2章 耐震設計
-護岸および連絡橋の耐震設計基準について記述します。
-基準地震動 Ss に対する構造健全性を確認しています。
-地盤改良工事と液状化対策の詳細データ。";
-
-    let chunks = chunk_text_by_lines(
-        md,
-        ChunkConfig {
-            max_chars: 75,
-            overlap_lines: 0,
-        },
+fn test_doc_representative_text() {
+    // summary wins over content; title returned separately
+    let d = json!({"title": "T", "summary": "要約", "content": "本文"});
+    assert_eq!(
+        doc_representative_text(&d, 100),
+        Some(DocText { title: Some("T".into()), text: "要約".into() })
     );
-    assert!(chunks.len() >= 2);
-    assert_eq!(chunks[0].start_line, 1);
-    assert!(chunks[0].text.contains("第1章"));
-
-    let sec2 = chunks.iter().find(|c| c.text.contains("第2章")).unwrap();
-    assert_eq!(sec2.start_line, 5);
-    assert!(sec2.end_line >= 6);
+    // content truncated by chars (multibyte safe)
+    let d = json!({"title": "T", "content": "あいうえお"});
+    assert_eq!(doc_representative_text(&d, 3).unwrap().text, "あいう");
+    // title-only fallback, and empty doc
+    assert_eq!(doc_representative_text(&json!({"title": "T"}), 10).unwrap().text, "T");
+    assert!(doc_representative_text(&json!({"n": 1}), 10).is_none());
 }
 
 #[test]
@@ -61,95 +49,51 @@ fn test_ruri_and_gemma_presets() {
 }
 
 #[test]
-fn test_mmap_vector_store_sq8_maxp_persistence_and_compaction() {
+fn test_mmap_vector_store_sq8_persistence_and_compaction() {
     let tmp = TempDir::new().unwrap();
 
-    // 1. Open store and insert multi-chunk documents
     {
         let store = MmapVectorStore::open(tmp.path()).unwrap();
-        store
-            .upsert_doc(
-                "doc1",
-                &[
-                    ChunkVectorInput {
-                        vector: vec![1.0, 0.0, 0.0, 0.0],
-                        start_line: 1,
-                        end_line: 30,
-                    },
-                    ChunkVectorInput {
-                        vector: vec![0.0, 1.0, 0.0, 0.0],
-                        start_line: 31,
-                        end_line: 65,
-                    },
-                ],
-            )
-            .unwrap();
-
-        store
-            .upsert_doc(
-                "doc2",
-                &[ChunkVectorInput {
-                    vector: vec![0.0, 0.0, 1.0, 0.0],
-                    start_line: 1,
-                    end_line: 20,
-                }],
-            )
-            .unwrap();
-
+        store.upsert_doc("doc1", &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        store.upsert_doc("doc2", &[0.0, 0.0, 1.0, 0.0]).unwrap();
         assert_eq!(store.active_doc_count(), 2);
-        assert_eq!(store.active_vector_count(), 3);
 
-        // Query close to doc1's second chunk (lines 31..=65)
         let hits = store.search(&[0.05, 0.98, 0.0, 0.0], 10, None).unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].doc_id, "doc1");
-        assert_eq!(hits[0].start_line, 31);
-        assert_eq!(hits[0].end_line, 65);
         assert!(hits[0].score > 0.95);
 
-        // Pre-filter to only allow doc2
         let mut allowed = HashSet::new();
         allowed.insert("doc2".to_string());
-        let filtered_hits = store
+        let filtered = store
             .search(&[0.05, 0.98, 0.0, 0.0], 10, Some(&allowed))
             .unwrap();
-        assert_eq!(filtered_hits.len(), 1);
-        assert_eq!(filtered_hits[0].doc_id, "doc2");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].doc_id, "doc2");
     }
 
-    // 2. Reopen from disk and test update + delete + compaction
+    // Reopen from disk, then update + delete + compaction
     {
         let store = MmapVectorStore::open(tmp.path()).unwrap();
         assert_eq!(store.dim(), 4);
         assert_eq!(store.active_doc_count(), 2);
-        assert_eq!(store.active_vector_count(), 3);
 
-        // Re-upsert doc1 with a single updated chunk
-        store
-            .upsert_doc(
-                "doc1",
-                &[ChunkVectorInput {
-                    vector: vec![0.0, 0.0, 0.0, 1.0],
-                    start_line: 1,
-                    end_line: 15,
-                }],
-            )
-            .unwrap();
-        assert_eq!(store.active_vector_count(), 2);
+        store.upsert_doc("doc1", &[0.0, 0.0, 0.0, 1.0]).unwrap();
+        assert_eq!(store.active_doc_count(), 2);
 
-        // Delete doc2
         assert!(store.delete_doc("doc2").unwrap());
         assert_eq!(store.active_doc_count(), 1);
-        assert_eq!(store.active_vector_count(), 1);
+        assert!(!store.delete_doc("doc2").unwrap());
 
-        // Compact and verify
         store.compact().unwrap();
         let hits = store.search(&[0.0, 0.0, 0.0, 1.0], 10, None).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_id, "doc1");
-        assert_eq!(hits[0].start_line, 1);
-        assert_eq!(hits[0].end_line, 15);
     }
+
+    // Replay after compaction/tombstones yields the same state
+    let store = MmapVectorStore::open(tmp.path()).unwrap();
+    assert_eq!(store.active_doc_count(), 1);
 }
 
 #[tokio::test]
@@ -198,14 +142,11 @@ async fn test_http_embedder_with_batching() {
     let q_vec = embedder.embed_query("MCNP 解析").await.unwrap();
     assert_eq!(q_vec.len(), 4);
 
-    let doc = json!({
-        "title": "遮蔽解析説明書",
-        "content": "第1行\n第2行"
-    });
-    let (title, chunks) = chunk_document_json(&doc, embedder.chunk_config());
-    let texts: Vec<String> = chunks.into_iter().map(|c| c.text).collect();
     let p_vecs = embedder
-        .embed_passages(title.as_deref(), &texts)
+        .embed_documents(&[DocText {
+            title: Some("遮蔽解析説明書".into()),
+            text: "第1行\n第2行".into(),
+        }])
         .await
         .unwrap();
     assert_eq!(p_vecs.len(), 1);
