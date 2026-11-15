@@ -850,3 +850,93 @@ async fn test_web_ui_toggle() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(!body.contains("<title>Tanpopo UI</title>"));
 }
+
+#[tokio::test]
+async fn test_index_terms_and_exclude_user_dict() {
+    use sudachi::dic::binary_loader::LoadedDictionary;
+    use sudachi::dic::build::DictBuilder;
+
+    let dict_dir = TempDir::new().unwrap();
+    let data_dir = TempDir::new().unwrap();
+
+    let sys_bytes = build_fallback_system_dic_bytes().unwrap();
+    std::fs::write(dict_dir.path().join("system.dic"), &sys_bytes).unwrap();
+
+    let loaded_sys = LoadedDictionary::load_system(&sys_bytes).unwrap();
+    let mut user_builder = DictBuilder::new_user(&loaded_sys);
+    let user_csv = "たんぽぽ検索,1,1,1000,たんぽぽ検索,名詞,固有名詞,一般,*,*,*,タンポポケンサク,たんぽぽ検索,*,A,*,*,*,*\n";
+    user_builder.read_lexicon(user_csv.as_bytes()).unwrap();
+    user_builder.resolve().unwrap();
+
+    let mut user_bytes = Vec::new();
+    user_builder.compile(&mut user_bytes).unwrap();
+    std::fs::write(dict_dir.path().join("user.dic"), user_bytes).unwrap();
+
+    let dict = load_dictionary_from_dir(Some(dict_dir.path()), None).unwrap();
+    let mgr = Arc::new(IndexManager::new(data_dir.path().to_path_buf(), dict, 15_000_000).unwrap());
+    let app = build_router(mgr);
+
+    let (status, _) = send_json(
+        &app,
+        Method::PUT,
+        "/docs",
+        Some(json!({
+            "mappings": {
+                "properties": {
+                    "title": { "type": "text", "analyzer": "sudachi" }
+                }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    for (id, title) in [
+        ("1", "たんぽぽ検索と東京"),
+        ("2", "たんぽぽ検索と関西国際空港"),
+        ("3", "東京の天気"),
+    ] {
+        let (status, _) = send_json(
+            &app,
+            Method::POST,
+            &format!("/docs/_doc/{id}?refresh=true"),
+            Some(json!({ "title": title })),
+        )
+        .await;
+        assert!(status.is_success());
+    }
+
+    // 1. All terms in title field (including user dict)
+    let (status, res) = send_json(&app, Method::GET, "/docs/_terms?field=title", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(res["total_docs"], 3);
+    assert_eq!(res["excluded_user_dict_terms"], 0);
+    let terms = res["terms"].as_array().unwrap();
+    let user_term = terms.iter().find(|t| t["term"] == "たんぽぽ検索").unwrap();
+    assert_eq!(user_term["doc_freq"], 2);
+    assert_eq!(user_term["in_user_dict"], true);
+    let sys_term = terms.iter().find(|t| t["term"] == "東京").unwrap();
+    assert_eq!(sys_term["doc_freq"], 2);
+    assert_eq!(sys_term["in_user_dict"], false);
+
+    // 2. Exclude user dictionary terms
+    let (status, res) = send_json(
+        &app,
+        Method::GET,
+        "/docs/_terms?field=title&exclude_user_dict=true",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(res["excluded_user_dict_terms"], 1);
+    let terms = res["terms"].as_array().unwrap();
+    assert!(!terms.iter().any(|t| t["term"] == "たんぽぽ検索"));
+    assert!(terms.iter().any(|t| t["term"] == "東京"));
+
+    // 3. Substring filter `q`
+    let (status, res) = send_json(&app, Method::GET, "/docs/_terms?field=title&q=空港", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let terms = res["terms"].as_array().unwrap();
+    assert!(terms.iter().all(|t| t["term"].as_str().unwrap().contains("空港")));
+    assert!(!terms.is_empty());
+}

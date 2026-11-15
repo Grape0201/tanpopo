@@ -181,6 +181,52 @@ impl SudachiTokenizer {
     }
 }
 
+/// Checks whether a token string is registered in a Sudachi user dictionary (`dict_id >= 1`).
+pub struct UserDictChecker<'a> {
+    dict: &'a JapaneseDictionary,
+    stateful: StatefulTokenizer<&'a JapaneseDictionary>,
+    morphemes: MorphemeList<&'a JapaneseDictionary>,
+}
+
+impl<'a> UserDictChecker<'a> {
+    pub fn new(dict: &'a JapaneseDictionary) -> Self {
+        Self {
+            dict,
+            stateful: StatefulTokenizer::new(dict, Mode::C),
+            morphemes: MorphemeList::empty(dict),
+        }
+    }
+
+    pub fn is_user_dict_term(&mut self, term: &str) -> bool {
+        if term.is_empty() {
+            return false;
+        }
+        // Exact surface match in any user dictionary (dict_id >= 1; 0 is system dict).
+        let exact_match = self
+            .dict
+            .lexicon()
+            .lookup(term.as_bytes(), 0)
+            .any(|entry| entry.end == term.len() && entry.word_id.dict().as_raw() >= 1);
+        if exact_match {
+            return true;
+        }
+        // Fallback: check if Sudachi tokenizes the term as a single user-dictionary morpheme.
+        self.stateful.reset().push_str(term);
+        if self.stateful.do_tokenize().is_err() {
+            return false;
+        }
+        if self.morphemes.collect_results(&mut self.stateful).is_err() {
+            return false;
+        }
+        self.morphemes.len() == 1
+            && self
+                .morphemes
+                .iter()
+                .next()
+                .is_some_and(|m| m.dictionary_id() >= 1)
+    }
+}
+
 pub struct SudachiTokenStream<'a> {
     tokens: &'a [Token],
     index: usize,

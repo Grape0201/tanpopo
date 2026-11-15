@@ -22,13 +22,16 @@
   .err { color: #b00020; }
   table { border-collapse: collapse; margin: 4px 0 12px; }
   td, th { border: 1px solid #ccc; padding: 2px 8px; text-align: left; }
+  .badge { display: inline-block; padding: 1px 6px; font-size: 0.78em; background: #e6f4ea; color: #137333; border-radius: 3px; }
+  .bar-wrap { width: 120px; background: #eee; height: 10px; display: inline-block; vertical-align: middle; margin-left: 6px; }
+  .bar { height: 100%; background: #f5c400; }
 </style>
 </head>
 <body>
 <header>🌼 Tanpopo</header>
 <main>
 <nav>
-  <button id="t-search" class="on">検索</button><button id="t-analyze">形態素解析</button>
+  <button id="t-search" class="on">検索</button><button id="t-analyze">形態素解析</button><button id="t-inspect">インデックス可視化</button>
 </nav>
 
 <section id="p-search">
@@ -64,6 +67,23 @@
   </div>
   <div id="tokens"></div>
 </section>
+
+<section id="p-inspect" hidden>
+  <div class="row">
+    <select id="ins-index"></select>
+    <select id="ins-field"><option value="_all">_all</option></select>
+    <input id="ins-q" class="q" type="text" placeholder="トークン絞り込み（部分一致）">
+    <label>件数 <select id="ins-limit"><option>100</option><option>200</option><option>500</option></select></label>
+    <label><input id="ins-excl" type="checkbox"> ユーザ定義辞書を除外</label>
+    <button id="ins-go" class="go">表示</button>
+  </div>
+  <details>
+    <summary>マッピング構造</summary>
+    <div id="ins-mapping"></div>
+  </details>
+  <div id="ins-summary" class="meta"></div>
+  <div id="ins-terms"></div>
+</section>
 </main>
 
 <script>
@@ -82,12 +102,13 @@ const el = (tag, text, cls) => {
   return e;
 };
 
-for (const t of ['search', 'analyze']) {
+for (const t of ['search', 'analyze', 'inspect']) {
   $('t-' + t).onclick = () => {
-    for (const u of ['search', 'analyze']) {
+    for (const u of ['search', 'analyze', 'inspect']) {
       $('p-' + u).hidden = u !== t;
       $('t-' + u).classList.toggle('on', u === t);
     }
+    if (t === 'inspect' && $('ins-index').value) loadInspect();
   };
 }
 
@@ -124,8 +145,10 @@ $('raw').onclick = () => {
 (async () => {
   $('index').append(new Option('(全インデックス)', ''));
   try {
-    for (const i of await call('/_cat/indices'))
+    for (const i of await call('/_cat/indices')) {
       $('index').append(new Option(`${i.index} (${i['docs.count']})`, i.index));
+      $('ins-index').append(new Option(`${i.index} (${i['docs.count']})`, i.index));
+    }
   } catch (e) { $('summary').textContent = e.message; }
 })();
 
@@ -152,6 +175,76 @@ const showAnalyze = async modes => {
 $('an').onclick = () => showAnalyze([$('mode').value]);
 $('abc').onclick = () => showAnalyze(['A', 'B', 'C']);
 $('text').onkeydown = e => { if (e.key === 'Enter') $('an').click(); };
+
+// ---- inspect ----
+async function loadMapping(idx) {
+  const prev = $('ins-field').value;
+  $('ins-field').replaceChildren(new Option('_all', '_all'));
+  $('ins-mapping').replaceChildren();
+  const res = await call('/' + encodeURIComponent(idx) + '/_mapping');
+  const props = res?.[idx]?.mappings?.properties || {};
+  const tbl = el('table');
+  const head = el('tr');
+  ['フィールド', '型', 'index analyzer', 'search analyzer'].forEach(h => head.append(el('th', h)));
+  tbl.append(head);
+  for (const [name, p] of Object.entries(props)) {
+    const tr = el('tr');
+    tr.append(el('td', name), el('td', p.type || ''), el('td', p.analyzer || '-'), el('td', p.search_analyzer || '-'));
+    tbl.append(tr);
+    if (p.type === 'text' || p.type === 'keyword') $('ins-field').append(new Option(name, name));
+  }
+  if ([...$('ins-field').options].some(o => o.value === prev)) $('ins-field').value = prev;
+  $('ins-mapping').append(tbl);
+}
+
+async function loadTerms(idx) {
+  $('ins-terms').replaceChildren();
+  $('ins-summary').className = 'meta';
+  const params = new URLSearchParams({
+    field: $('ins-field').value || '_all',
+    limit: $('ins-limit').value || '100',
+    exclude_user_dict: String($('ins-excl').checked),
+  });
+  if ($('ins-q').value.trim()) params.set('q', $('ins-q').value.trim());
+  const res = await call('/' + encodeURIComponent(idx) + '/_terms?' + params.toString());
+  const exclInfo = res.excluded_user_dict_terms ? ` / ユーザ辞書除外: ${res.excluded_user_dict_terms} 件` : '';
+  $('ins-summary').textContent = `ドキュメント数: ${res.total_docs} / ユニークトークン数: ${res.total_unique_terms}${exclInfo} / 表示: ${res.terms.length} 件`;
+  const maxFreq = res.terms.reduce((m, t) => Math.max(m, t.doc_freq), 1);
+  const tbl = el('table');
+  const head = el('tr');
+  ['#', 'トークン', '出現ドキュメント数', '辞書'].forEach(h => head.append(el('th', h)));
+  tbl.append(head);
+  res.terms.forEach((t, i) => {
+    const tr = el('tr');
+    const freqTd = el('td', String(t.doc_freq));
+    const wrap = el('span', undefined, 'bar-wrap');
+    const bar = el('div', undefined, 'bar');
+    bar.style.width = Math.round((t.doc_freq / maxFreq) * 100) + '%';
+    wrap.append(bar);
+    freqTd.append(wrap);
+    const dictTd = el('td');
+    if (t.in_user_dict) dictTd.append(el('span', 'ユーザ辞書', 'badge'));
+    else dictTd.textContent = '-';
+    tr.append(el('td', String(i + 1)), el('td', t.term), freqTd, dictTd);
+    tbl.append(tr);
+  });
+  $('ins-terms').append(tbl);
+}
+
+async function loadInspect(refreshMapping = true) {
+  const idx = $('ins-index').value;
+  if (!idx) { $('ins-summary').textContent = 'インデックスがありません'; return; }
+  try {
+    if (refreshMapping) await loadMapping(idx);
+    await loadTerms(idx);
+  } catch (e) { $('ins-summary').className = 'err'; $('ins-summary').textContent = e.message; }
+}
+$('ins-index').onchange = () => loadInspect(true);
+$('ins-field').onchange = () => loadInspect(false);
+$('ins-excl').onchange = () => loadInspect(false);
+$('ins-limit').onchange = () => loadInspect(false);
+$('ins-go').onclick = () => loadInspect(false);
+$('ins-q').onkeydown = e => { if (e.key === 'Enter') loadInspect(false); };
 </script>
 </body>
 </html>

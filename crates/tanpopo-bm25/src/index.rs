@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -11,13 +11,15 @@ use tantivy::collector::TopDocs;
 use tantivy::directory::MmapDirectory;
 use tantivy::query::TermQuery;
 use tantivy::schema::{
-    DateOptions, DateTimePrecision, FAST, Field, IndexRecordOption, NumericOptions, STORED,
-    STRING, Schema, TantivyDocument, Term, TextFieldIndexing, TextOptions, Value as TValue,
+    DateOptions, DateTimePrecision, FAST, Field, FieldType, IndexRecordOption, NumericOptions,
+    STORED, STRING, Schema, TantivyDocument, Term, TextFieldIndexing, TextOptions, Value as TValue,
 };
 use tantivy::{DateTime, Index, IndexReader, IndexWriter, ReloadPolicy};
 use thiserror::Error;
 
-use crate::tokenizer::{SudachiTokenizer, SudachiTokenizerConfig, register_default_tokenizers};
+use crate::tokenizer::{
+    SudachiTokenizer, SudachiTokenizerConfig, UserDictChecker, register_default_tokenizers,
+};
 
 pub const FIELD_ID: &str = "_id";
 pub const FIELD_SOURCE: &str = "_source";
@@ -788,6 +790,115 @@ impl IndexManager {
         }
         Ok(matched.into_values().collect())
     }
+
+    pub fn list_index_terms(
+        &self,
+        index_name: &str,
+        field_name: Option<&str>,
+        query: Option<&str>,
+        limit: usize,
+        exclude_user_dict: bool,
+    ) -> Result<IndexTermsResponse, AppError> {
+        let managed = self.get_index(index_name)?;
+        let field_name = field_name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(FIELD_ALL);
+
+        let schema = managed.index.schema();
+        let field = schema.get_field(field_name).map_err(|_| {
+            AppError::BadRequest(format!("unknown field [{field_name}] in index [{index_name}]"))
+        })?;
+        if !matches!(schema.get_field_entry(field).field_type(), FieldType::Str(_)) {
+            return Err(AppError::BadRequest(format!(
+                "field [{field_name}] is not a text or keyword field"
+            )));
+        }
+
+        let searcher = managed.reader.searcher();
+        let total_docs = searcher.num_docs();
+        let mut term_freqs: HashMap<String, u64> = HashMap::new();
+
+        for segment_reader in searcher.segment_readers() {
+            let inv_idx = segment_reader
+                .inverted_index(field)
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            let mut stream = inv_idx
+                .terms()
+                .stream()
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            while stream.advance() {
+                if let Ok(term_str) = std::str::from_utf8(stream.key()) {
+                    *term_freqs.entry(term_str.to_string()).or_insert(0) +=
+                        u64::from(stream.value().doc_freq);
+                }
+            }
+        }
+
+        let total_unique_terms = term_freqs.len();
+        let q_lower = query
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_lowercase);
+
+        let mut sorted: Vec<(String, u64)> = term_freqs
+            .into_iter()
+            .filter(|(term, _)| {
+                q_lower
+                    .as_ref()
+                    .is_none_or(|q| term.to_lowercase().contains(q))
+            })
+            .collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let limit = limit.clamp(1, 1000);
+        let mut checker = UserDictChecker::new(&self.dict);
+        let mut excluded_user_dict_terms = 0usize;
+        let mut terms = Vec::with_capacity(limit.min(sorted.len()));
+
+        for (term, doc_freq) in sorted {
+            let in_user_dict = checker.is_user_dict_term(&term);
+            if exclude_user_dict && in_user_dict {
+                excluded_user_dict_terms += 1;
+                continue;
+            }
+            if terms.len() < limit {
+                terms.push(TermStat {
+                    term,
+                    doc_freq,
+                    in_user_dict,
+                });
+            } else if !exclude_user_dict {
+                break;
+            }
+        }
+
+        Ok(IndexTermsResponse {
+            index: index_name.to_string(),
+            field: field_name.to_string(),
+            total_docs,
+            total_unique_terms,
+            excluded_user_dict_terms,
+            terms,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TermStat {
+    pub term: String,
+    pub doc_freq: u64,
+    pub in_user_dict: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexTermsResponse {
+    pub index: String,
+    pub field: String,
+    pub total_docs: u64,
+    pub total_unique_terms: usize,
+    pub excluded_user_dict_terms: usize,
+    pub terms: Vec<TermStat>,
 }
 
 fn wildcard_match(pattern: &str, text: &str) -> bool {
