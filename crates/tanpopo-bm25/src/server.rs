@@ -76,7 +76,6 @@ pub fn build_router_with_ui(state: SharedState, ui_enabled: bool) -> Router {
         )
         .route("/{index}/_mapping", get(get_index_mapping_handler))
         .route("/{index}/_mappings", get(get_index_mapping_handler))
-        .route("/{index}/_terms", get(get_index_terms_handler))
         .route("/{index}/_analyze", post(analyze_index_handler).get(analyze_index_handler))
         .route("/{index}/_refresh", post(refresh_index_handler).get(refresh_index_handler))
         .route("/{index}/_bulk", post(bulk_index_handler).put(bulk_index_handler))
@@ -314,38 +313,6 @@ async fn refresh_index_handler(
     Ok(Json(json!({
         "_shards": { "total": 1, "successful": 1, "failed": 0 }
     })))
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct TermsQuery {
-    #[serde(default)]
-    field: Option<String>,
-    #[serde(default)]
-    q: Option<String>,
-    #[serde(default)]
-    pos: Option<String>,
-    #[serde(default)]
-    limit: Option<usize>,
-    #[serde(default)]
-    exclude_user_dict: Option<bool>,
-}
-
-async fn get_index_terms_handler(
-    State(mgr): State<SharedState>,
-    Path(index): Path<String>,
-    Query(q): Query<TermsQuery>,
-) -> Result<Json<Value>, AppError> {
-    let res = mgr.list_index_terms(
-        &index,
-        q.field.as_deref(),
-        q.q.as_deref(),
-        q.pos.as_deref(),
-        q.limit.unwrap_or(100),
-        q.exclude_user_dict.unwrap_or(false),
-    )?;
-    serde_json::to_value(res)
-        .map(Json)
-        .map_err(|e| AppError::Internal(e.to_string()))
 }
 
 #[derive(Debug, Default, Deserialize)]
