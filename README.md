@@ -1,25 +1,25 @@
 # Tanpopo (たんぽぽ)
 
-Tanpopo (たんぽぽ / Dandelion) is a lightweight, memory-efficient Japanese full-text search server built on top of [Tantivy](https://github.com/quickwit-oss/tantivy) and [Sudachi.rs](https://github.com/WorksApplications/sudachi.rs).
-Just as Tantivy takes inspiration from the French word for dandelion, Tanpopo brings that same blazing speed to Japanese text search with a feather-light memory footprint and an Elasticsearch-compatible REST API subset.
+Tanpopo（たんぽぽ）は、[Tantivy](https://github.com/quickwit-oss/tantivy) と [Sudachi.rs](https://github.com/WorksApplications/sudachi.rs) を基盤とした、軽量かつ省メモリな日本語全文検索サーバです。
+Tantivy の名前がフランス語の「タンポポ」に由来するように、Tanpopo はその高速性をそのままに、極めて少ないメモリ消費量と Elasticsearch 互換の REST API サブセットで日本語テキスト検索を実現します。
 
-## Workspace Structure
+## ワークスペース構成
 
-- **`crates/tanpopo`**: Hybrid search server & MCP orchestrating `tanpopo-bm25` and `tanpopo-vector` with Reciprocal Rank Fusion (RRF) and Linear Combination.
-- **`crates/tanpopo-bm25`**: Standalone Japanese BM25 full-text search engine (Sudachi.rs + Tantivy). Can be run independently via `cargo run --release -p tanpopo-bm25`.
-- **`crates/tanpopo-vector`**: Lightweight `mmap` SQ8 (`i8`) vector store with parallel SIMD dot-product (1 document = 1 vector, embedded from `title` + `summary`, or the first `TANPOPO_DOC_EMBED_CHARS` (default 4000) characters of `content`/`body`), and OpenAI-compatible `/v1/embeddings` client (`ruri` / `gemma` native prefixes). Vector stores from older chunk-based versions must be deleted and re-indexed.
+- **`crates/tanpopo`**: `tanpopo-bm25` と `tanpopo-vector` を Reciprocal Rank Fusion (RRF) および線形結合（Linear Combination）で統合するハイブリッド検索サーバ & MCP サーバ。
+- **`crates/tanpopo-bm25`**: 単体動作可能な日本語 BM25 全文検索エンジン（Sudachi.rs + Tantivy）。`cargo run --release -p tanpopo-bm25` で独立して起動できます。
+- **`crates/tanpopo-vector`**: 並列 SIMD 内積計算を備えた軽量な `mmap` SQ8（`i8`）ベクトルストア（1ドキュメント = 1ベクトル、`title` + `summary`、または `content`/`body` の先頭 `TANPOPO_DOC_EMBED_CHARS` 文字（デフォルト 4000）を埋め込み）と、OpenAI 互換の `/v1/embeddings` クライアント（`ruri` / `gemma` ネイティブプレフィックス対応）。旧チャンクベース版のベクトルストアは削除して再インデックスする必要があります。
 
-## Features
+## 主な特徴
 
-- **Low Memory Footprint**:
-  - Loads Sudachi's system and user dictionaries via `mmap` (`Arc<JapaneseDictionary>`) and shares them across all indices and threads with zero heap duplication.
-  - Delegates index storage to OS page cache via Tantivy's `MmapDirectory` and caps per-index `IndexWriter` heap (`15 MB` default).
-- **Japanese Morphological Analysis (Sudachi.rs)**:
-  - Automatic discovery of system and user dictionaries in a directory (`TANPOPO_SUDACHI_DICT_DIR` or `./resources`).
-  - Split modes `A` (short), `B` (middle), and `C` (long).
-  - Spelling & inflection normalization via `normalized_form` (e.g., `打込む` ↔ `打ち込む`, `しょうゆ` ↔ `醤油`), `dictionary_form`, or `surface`.
-  - Part-of-speech (`stop_tags`) and stopword filtering.
-- **Elasticsearch-Compatible REST API Subset**:
+- **省メモリ設計**:
+  - Sudachi のシステム辞書・ユーザ辞書を `mmap`（`Arc<JapaneseDictionary>`）で読み込み、ヒープの複製なしに全インデックス・全スレッドで共有します。
+  - Tantivy の `MmapDirectory` によりインデックスストレージを OS のページキャッシュへ委譲し、インデックスごとの `IndexWriter` ヒープ上限を設定します（デフォルト `15 MB`）。
+- **日本語形態素解析 (Sudachi.rs)**:
+  - 指定ディレクトリ（`TANPOPO_SUDACHI_DICT_DIR` または `./resources`）内のシステム辞書・ユーザ辞書の自動検出。
+  - 分割モード `A`（短単位）、`B`（中単位）、`C`（長単位）に対応。
+  - `normalized_form`（例: `打込む` ↔ `打ち込む`、`しょうゆ` ↔ `醤油`）、`dictionary_form`、`surface` による表記ゆれ・活用の正規化。
+  - 品詞（`stop_tags`）およびストップワードによるフィルタリング。
+- **Elasticsearch 互換 REST API サブセット**:
   - `GET /`, `GET /_cluster/health`, `GET /_cat/indices`
   - `GET /_mapping`, `GET /:index/_mapping`
   - `POST /_analyze`, `POST /:index/_analyze`
@@ -28,15 +28,14 @@ Just as Tantivy takes inspiration from the French word for dandelion, Tanpopo br
   - `POST /_bulk`, `POST /:index/_bulk` (NDJSON)
   - `POST /_search`, `POST /:index/_search`, `GET /:index/_search?q=...` (`match`, `match_phrase`, `multi_match`, `term`, `terms`, `wildcard`, `range`, `bool`, `query_string`, `aggs`, `sort`, `docvalue_fields`)
   - `POST /_msearch`, `POST /:index/_msearch` (NDJSON)
+- **組み込み Web UI**: 追加依存なしで使える単一ファイルの検索・解析コンソールを `http://localhost:9200/_ui` で提供します。無効化する場合は `TANPOPO_UI=0` を設定してください。
 
-- **Built-in Web UI**: a single-file search / analyze console at `http://localhost:9200/_ui` (no extra dependencies). Set `TANPOPO_UI=0` to disable it.
+## クイックスタート
 
-## Quick Start
+### 1. Sudachi 辞書の準備（システム辞書 + 任意のユーザ辞書）
 
-### 1. Prepare Sudachi Dictionaries (System + Optional User Dictionaries)
-
-Place Sudachi binary dictionaries (`.dic`) in `./resources` or point `TANPOPO_SUDACHI_DICT_DIR` to your dictionary directory.
-Tanpopo will automatically detect the system dictionary (`system.dic`, `system_core.dic`, etc.) and register any other `.dic` files (e.g., `user.dic`, `custom_terms.dic`) as user-defined dictionaries:
+Sudachi のバイナリ辞書（`.dic`）を `./resources` に配置するか、`TANPOPO_SUDACHI_DICT_DIR` で辞書ディレクトリを指定します。
+Tanpopo はシステム辞書（`system.dic`、`system_core.dic` など）を自動検出し、その他の `.dic` ファイル（例: `user.dic`、`custom_terms.dic`）をすべてユーザ定義辞書として登録します。
 
 ```bash
 mkdir -p resources
@@ -44,13 +43,13 @@ curl -L -o /tmp/sudachi-dic.zip https://d2ej7fkh96ddlu.cloudfront.net/sudachidic
 unzip -j /tmp/sudachi-dic.zip "*/system_core.dic" -d resources/
 mv resources/system_core.dic resources/system.dic
 
-# (Optional) Drop any compiled user dictionaries (*.dic) into resources/
-# e.g., resources/user.dic or resources/my_terms.dic
+# (任意) ビルド済みのユーザ辞書 (*.dic) を resources/ に配置
+# 例: resources/user.dic や resources/my_terms.dic
 ```
 
-*(If omitted, Tanpopo starts with a minimal built-in fallback dictionary for testing and quick experimentation).*
+*（省略した場合、Tanpopo はテストや簡易検証用の最小限の組み込みフォールバック辞書で起動します。）*
 
-### 2. Run the Server
+### 2. サーバの起動
 
 ```bash
 TANPOPO_BIND="127.0.0.1:9200" \
@@ -62,18 +61,18 @@ TANPOPO_EMBED_MODEL="cl-nagoya/ruri-v3-310m" \
 cargo run --release -p tanpopo
 ```
 
-> **Note**: Omit `TANPOPO_EMBED_URL` (or run `cargo run --release -p tanpopo-bm25`) for pure BM25 mode. For backward compatibility, `TANPOPO_DICT_PATH="./resources/system.dic"` can still be used to specify an explicit system dictionary file.
+> **補足**: 純粋な BM25 モードで動かす場合は `TANPOPO_EMBED_URL` を省略するか、`cargo run --release -p tanpopo-bm25` を実行してください。後方互換性のため、`TANPOPO_DICT_PATH="./resources/system.dic"` によるシステム辞書ファイルの明示指定も引き続き利用できます。
 
-### 3. API Examples
+### 3. API 使用例
 
-#### Analyze Japanese Text
+#### 日本語テキストの形態素解析
 ```bash
 curl -X POST http://localhost:9200/_analyze \
   -H 'Content-Type: application/json' \
   -d '{"text": "関西国際空港に行く", "mode": "A"}'
 ```
 
-#### Create an Index with Custom Japanese Analyzer
+#### カスタム日本語アナライザ付きインデックスの作成
 ```bash
 curl -X PUT http://localhost:9200/articles \
   -H 'Content-Type: application/json' \
@@ -100,7 +99,7 @@ curl -X PUT http://localhost:9200/articles \
   }'
 ```
 
-#### Search Documents
+#### ドキュメントの検索
 ```bash
 curl -X POST http://localhost:9200/articles/_search \
   -H 'Content-Type: application/json' \
@@ -116,11 +115,18 @@ curl -X POST http://localhost:9200/articles/_search \
 
 ## MCP (Model Context Protocol)
 
-Tanpopo is an MCP server for agentic search. Tools: `list_indices`, `search` (with line-numbered Sudachi highlights, `_source` truncation/filtering, `minimum_should_match`, and token diagnostics), `get_document` (with `start_line`/`end_line`, `offset`/`length`, and `outline`), `search_in_document` (in-document grep with Sudachi normalization), `analyze_text`.
+Tanpopo はエージェント検索向けの MCP サーバとしても動作します。提供ツール: `list_indices`、`search`（行番号付きの Sudachi ハイライト、`_source` の切り詰め/フィルタリング、`minimum_should_match`、トークン診断に対応）、`get_document`（`start_line`/`end_line`、`offset`/`length`、`outline` に対応）、`search_in_document`（Sudachi 正規化を用いたドキュメント内検索）、`analyze_text`。
 
 - HTTP: `POST http://localhost:9200/mcp` (JSON-RPC 2.0)
-- stdio: `tanpopo --mcp` (or `TANPOPO_MCP_STDIO=1`; logs go to stderr)
+- stdio: `tanpopo --mcp`（または `TANPOPO_MCP_STDIO=1`。ログは stderr に出力されます）
 
 ```json
 { "mcpServers": { "tanpopo": { "command": "tanpopo", "args": ["--mcp"], "env": { "TANPOPO_DATA_DIR": "./data" } } } }
 ```
+
+## ライセンス
+
+以下のいずれかのライセンスのもとで提供されます（選択可能）。
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) または http://www.apache.org/licenses/LICENSE-2.0)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) または http://opensource.org/licenses/MIT)

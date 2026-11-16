@@ -2,6 +2,7 @@
 name = "tanpopo-vector"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Lightweight mmap-backed SQ8 vector store, and HTTP embedding client for Tanpopo"
 
 [dependencies]
