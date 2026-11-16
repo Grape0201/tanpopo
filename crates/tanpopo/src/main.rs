@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tanpopo::engine::HybridManager;
 use tanpopo::index::IndexManager;
 use tanpopo::server::build_router_with_ui;
-use tanpopo::tokenizer::load_dictionary_from_dir;
+use tanpopo::tokenizer::load_dictionary_with_fingerprint;
 use tanpopo::vector::{EmbedConfig, Embedder, HttpEmbedder};
 use tracing_subscriber::EnvFilter;
 
@@ -31,8 +31,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(15_000_000);
 
-    let dict = load_dictionary_from_dir(dict_dir.as_deref(), dict_path.as_deref())?;
-    let bm25_mgr = Arc::new(IndexManager::new(data_dir.clone(), dict, writer_heap_bytes)?);
+    let loaded = load_dictionary_with_fingerprint(dict_dir.as_deref(), dict_path.as_deref())?;
+    let bm25_mgr = Arc::new(IndexManager::new_with_fingerprint(
+        data_dir.clone(),
+        loaded.dict,
+        loaded.fingerprint,
+        writer_heap_bytes,
+    )?);
 
     let embedder: Option<Arc<dyn Embedder>> = EmbedConfig::from_env().map(|cfg| {
         tracing::info!(

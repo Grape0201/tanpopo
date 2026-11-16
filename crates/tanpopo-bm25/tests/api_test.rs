@@ -8,6 +8,7 @@ use tanpopo_bm25::server::build_router;
 use tanpopo_bm25::tokenizer::{
     SplitMode, SudachiTokenizer, SudachiTokenizerConfig, TokenForm, build_fallback_dictionary,
     build_fallback_system_dic_bytes, discover_dictionaries, load_dictionary_from_dir,
+    load_dictionary_with_fingerprint,
 };
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -939,4 +940,130 @@ async fn test_index_terms_and_exclude_user_dict() {
     let terms = res["terms"].as_array().unwrap();
     assert!(terms.iter().all(|t| t["term"].as_str().unwrap().contains("空港")));
     assert!(!terms.is_empty());
+}
+
+#[tokio::test]
+async fn test_auto_rebuild_on_dictionary_mismatch() {
+    use sudachi::dic::binary_loader::LoadedDictionary;
+    use sudachi::dic::build::DictBuilder;
+
+    let dict_dir = TempDir::new().unwrap();
+    let data_dir = TempDir::new().unwrap();
+
+    let sys_bytes = build_fallback_system_dic_bytes().unwrap();
+    std::fs::write(dict_dir.path().join("system.dic"), &sys_bytes).unwrap();
+
+    // 1. Start with system dictionary only
+    let loaded_v1 = load_dictionary_with_fingerprint(Some(dict_dir.path()), None).unwrap();
+    let fp_v1 = loaded_v1.fingerprint.clone();
+    {
+        let mgr = Arc::new(
+            IndexManager::new_with_fingerprint(
+                data_dir.path().to_path_buf(),
+                loaded_v1.dict,
+                fp_v1.clone(),
+                15_000_000,
+            )
+            .unwrap(),
+        );
+        let app = build_router(mgr);
+
+        let (status, _) = send_json(
+            &app,
+            Method::PUT,
+            "/docs",
+            Some(json!({
+                "mappings": {
+                    "properties": {
+                        "title": { "type": "text", "analyzer": "sudachi" }
+                    }
+                }
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = send_json(
+            &app,
+            Method::POST,
+            "/docs/_doc/d1?refresh=true",
+            Some(json!({ "title": "新語テストワードと東京" })),
+        )
+        .await;
+        assert!(status.is_success());
+
+        // Before adding user dict, "新語テストワード" is not a single user-dict token
+        let (status, res) = send_json(&app, Method::GET, "/docs/_terms?field=title", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let terms = res["terms"].as_array().unwrap();
+        assert!(!terms.iter().any(|t| t["term"] == "新語テストワード"));
+    }
+
+    // 2. Add a user dictionary and restart IndexManager -> should auto-rebuild
+    let loaded_sys = LoadedDictionary::load_system(&sys_bytes).unwrap();
+    let mut user_builder = DictBuilder::new_user(&loaded_sys);
+    let user_csv = "新語テストワード,1,1,1000,新語テストワード,名詞,固有名詞,一般,*,*,*,シンゴテストワード,新語テストワード,*,A,*,*,*,*\n";
+    user_builder.read_lexicon(user_csv.as_bytes()).unwrap();
+    user_builder.resolve().unwrap();
+    let mut user_bytes = Vec::new();
+    user_builder.compile(&mut user_bytes).unwrap();
+    std::fs::write(dict_dir.path().join("user.dic"), user_bytes).unwrap();
+
+    let loaded_v2 = load_dictionary_with_fingerprint(Some(dict_dir.path()), None).unwrap();
+    assert_ne!(loaded_v2.fingerprint, fp_v1);
+    let fp_v2 = loaded_v2.fingerprint.clone();
+
+    {
+        let mgr = Arc::new(
+            IndexManager::new_with_fingerprint(
+                data_dir.path().to_path_buf(),
+                loaded_v2.dict,
+                fp_v2.clone(),
+                15_000_000,
+            )
+            .unwrap(),
+        );
+        let app = build_router(mgr);
+
+        // Rebuilt index must now have "新語テストワード" as a user-dict term and no leftover split tokens
+        let (status, res) = send_json(&app, Method::GET, "/docs/_terms?field=title", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(res["total_docs"], 1);
+        let terms = res["terms"].as_array().unwrap();
+        let user_term = terms
+            .iter()
+            .find(|t| t["term"] == "新語テストワード")
+            .expect("rebuilt index should contain user dict term");
+        assert_eq!(user_term["in_user_dict"], true);
+        assert!(!terms.iter().any(|t| t["term"] == "テスト"));
+
+        // _source must be preserved intact
+        let (status, doc_res) = send_json(&app, Method::GET, "/docs/_doc/d1", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(doc_res["_source"]["title"], "新語テストワードと東京");
+    }
+
+    // 3. Restarting again with the same fingerprint keeps the index intact
+    let loaded_v2_again = load_dictionary_with_fingerprint(Some(dict_dir.path()), None).unwrap();
+    assert_eq!(loaded_v2_again.fingerprint, fp_v2);
+    let mgr = Arc::new(
+        IndexManager::new_with_fingerprint(
+            data_dir.path().to_path_buf(),
+            loaded_v2_again.dict,
+            loaded_v2_again.fingerprint,
+            15_000_000,
+        )
+        .unwrap(),
+    );
+    let app = build_router(mgr);
+    let (status, res) = send_json(&app, Method::GET, "/docs/_terms?field=title", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(res["total_docs"], 1);
+    assert!(
+        res["terms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["term"] == "新語テストワード")
+    );
 }

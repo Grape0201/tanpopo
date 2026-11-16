@@ -25,6 +25,12 @@ pub const FIELD_ID: &str = "_id";
 pub const FIELD_SOURCE: &str = "_source";
 pub const FIELD_ALL: &str = "_all";
 const META_FILENAME: &str = "tanpopo_meta.json";
+const DICT_META_FILENAME: &str = "tanpopo_dict.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DictMeta {
+    fingerprint: String,
+}
 
 static DOC_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -581,6 +587,7 @@ pub fn infer_mappings_from_doc(doc_json: &Value) -> CreateIndexRequest {
 pub struct IndexManager {
     data_dir: PathBuf,
     pub dict: Arc<JapaneseDictionary>,
+    dict_fingerprint: Option<String>,
     writer_heap_bytes: usize,
     indices: RwLock<BTreeMap<String, Arc<ManagedIndex>>>,
 }
@@ -591,10 +598,29 @@ impl IndexManager {
         dict: Arc<JapaneseDictionary>,
         writer_heap_bytes: usize,
     ) -> Result<Self, AppError> {
+        Self::new_internal(data_dir, dict, None, writer_heap_bytes)
+    }
+
+    pub fn new_with_fingerprint(
+        data_dir: PathBuf,
+        dict: Arc<JapaneseDictionary>,
+        dict_fingerprint: String,
+        writer_heap_bytes: usize,
+    ) -> Result<Self, AppError> {
+        Self::new_internal(data_dir, dict, Some(dict_fingerprint), writer_heap_bytes)
+    }
+
+    fn new_internal(
+        data_dir: PathBuf,
+        dict: Arc<JapaneseDictionary>,
+        dict_fingerprint: Option<String>,
+        writer_heap_bytes: usize,
+    ) -> Result<Self, AppError> {
         std::fs::create_dir_all(&data_dir).map_err(|e| AppError::Internal(e.to_string()))?;
         let mgr = Self {
             data_dir,
             dict,
+            dict_fingerprint,
             writer_heap_bytes: writer_heap_bytes.max(15_000_000),
             indices: RwLock::new(BTreeMap::new()),
         };
@@ -604,6 +630,28 @@ impl IndexManager {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    fn auto_rebuild_enabled() -> bool {
+        !std::env::var("TANPOPO_AUTO_REBUILD")
+            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+    }
+
+    fn read_dict_fingerprint(dir_path: &Path) -> Option<String> {
+        let bytes = std::fs::read(dir_path.join(DICT_META_FILENAME)).ok()?;
+        serde_json::from_slice::<DictMeta>(&bytes)
+            .ok()
+            .map(|m| m.fingerprint)
+    }
+
+    fn write_dict_fingerprint(dir_path: &Path, fingerprint: &str) -> Result<(), AppError> {
+        let bytes = serde_json::to_vec_pretty(&DictMeta {
+            fingerprint: fingerprint.to_string(),
+        })
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+        std::fs::write(dir_path.join(DICT_META_FILENAME), bytes)
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        Ok(())
     }
 
     fn load_existing_indices(&self) -> Result<(), AppError> {
@@ -616,12 +664,16 @@ impl IndexManager {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() || !path.join("meta.json").exists() {
-                continue;
-            }
             let Some(name) = path.file_name().and_then(|n| n.to_str()).map(String::from) else {
                 continue;
             };
+            if path.is_dir() && name.starts_with(".rebuild_") {
+                let _ = std::fs::remove_dir_all(&path);
+                continue;
+            }
+            if name.starts_with('.') || !path.is_dir() || !path.join("meta.json").exists() {
+                continue;
+            }
             let meta_path = path.join(META_FILENAME);
             let meta: CreateIndexRequest = if meta_path.exists() {
                 let bytes =
@@ -630,10 +682,147 @@ impl IndexManager {
             } else {
                 CreateIndexRequest::default()
             };
-            let managed = self.open_or_init_index(&name, &path, meta)?;
+            let mut managed = self.open_or_init_index(&name, &path, meta.clone())?;
+
+            if let Some(ref current_fp) = self.dict_fingerprint {
+                let stored_fp = Self::read_dict_fingerprint(&path);
+                if stored_fp.as_deref() != Some(current_fp.as_str()) {
+                    let docs = managed.doc_count();
+                    if docs == 0 {
+                        Self::write_dict_fingerprint(&path, current_fp)?;
+                    } else if Self::auto_rebuild_enabled() {
+                        tracing::info!(
+                            "Sudachi dictionary mismatch for index [{}] (stored: {:?}, current: {}); rebuilding {} document(s)...",
+                            name,
+                            stored_fp,
+                            current_fp,
+                            docs
+                        );
+                        managed = self.rebuild_index_dir(&name, &path, meta, managed, current_fp)?;
+                    } else {
+                        tracing::warn!(
+                            "Sudachi dictionary mismatch for index [{}] (TANPOPO_AUTO_REBUILD=0; skipping rebuild)",
+                            name
+                        );
+                    }
+                }
+            }
+
             map.insert(name, Arc::new(managed));
         }
         Ok(())
+    }
+
+    fn rebuild_index_dir(
+        &self,
+        name: &str,
+        dir_path: &Path,
+        meta: CreateIndexRequest,
+        old_managed: ManagedIndex,
+        new_fingerprint: &str,
+    ) -> Result<ManagedIndex, AppError> {
+        let start = std::time::Instant::now();
+        let docs = collect_live_documents(&old_managed)?;
+        let doc_count = docs.len();
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let staging_dir = self.data_dir.join(format!(".rebuild_{name}_{ts}"));
+        let rebuild_res: Result<(), AppError> = (|| {
+            let new_managed = self.open_or_init_index(name, &staging_dir, meta.clone())?;
+            {
+                let mut writer = new_managed
+                    .writer
+                    .lock()
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                for (doc_id, doc_json) in docs {
+                    let tantivy_doc = new_managed.build_tantivy_doc(&doc_id, &doc_json)?;
+                    writer
+                        .add_document(tantivy_doc)
+                        .map_err(|e| AppError::Internal(e.to_string()))?;
+                }
+                writer
+                    .commit()
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+            }
+            let ManagedIndex {
+                writer,
+                reader,
+                index,
+                ..
+            } = new_managed;
+            writer
+                .into_inner()
+                .map_err(|e| AppError::Internal(e.to_string()))?
+                .wait_merging_threads()
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            drop(reader);
+            drop(index);
+            Ok(())
+        })();
+
+        if let Err(e) = rebuild_res {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            return Err(e);
+        }
+
+        // Release old Tantivy reader/writer/mmap handles and wait for any background merge threads.
+        let ManagedIndex {
+            writer: old_writer,
+            reader: old_reader,
+            index: old_index,
+            ..
+        } = old_managed;
+        if let Ok(w) = old_writer.into_inner() {
+            let _ = w.wait_merging_threads();
+        }
+        drop(old_reader);
+        drop(old_index);
+
+        // Remove old Tantivy files while preserving non-Tantivy files (e.g. vectors.sq8 / vectors.meta).
+        for entry in std::fs::read_dir(dir_path)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .flatten()
+        {
+            let file_name = entry.file_name();
+            let fname = file_name.to_string_lossy();
+            if fname == META_FILENAME || fname == DICT_META_FILENAME || fname.starts_with("vectors.")
+            {
+                continue;
+            }
+            let p = entry.path();
+            if p.is_dir() {
+                std::fs::remove_dir_all(&p).map_err(|e| AppError::Internal(e.to_string()))?;
+            } else {
+                std::fs::remove_file(&p).map_err(|e| AppError::Internal(e.to_string()))?;
+            }
+        }
+
+        for entry in std::fs::read_dir(&staging_dir)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .flatten()
+        {
+            let file_name = entry.file_name();
+            let fname = file_name.to_string_lossy();
+            if fname == META_FILENAME || fname == DICT_META_FILENAME {
+                continue;
+            }
+            std::fs::rename(entry.path(), dir_path.join(&file_name))
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+        }
+        let _ = std::fs::remove_dir_all(&staging_dir);
+
+        let rebuilt = self.open_or_init_index(name, dir_path, meta)?;
+        Self::write_dict_fingerprint(dir_path, new_fingerprint)?;
+        tracing::info!(
+            "Rebuilt index [{}] ({} document(s)) in {} ms",
+            name,
+            doc_count,
+            start.elapsed().as_millis()
+        );
+        Ok(rebuilt)
     }
 
     fn open_or_init_index(
@@ -697,6 +886,9 @@ impl IndexManager {
         }
         let dir_path = self.data_dir.join(name);
         let managed = Arc::new(self.open_or_init_index(name, &dir_path, req)?);
+        if let Some(ref fp) = self.dict_fingerprint {
+            Self::write_dict_fingerprint(&dir_path, fp)?;
+        }
         map.insert(name.to_string(), managed.clone());
         Ok(managed)
     }
@@ -926,6 +1118,45 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
         }
     }
     true
+}
+
+fn collect_live_documents(managed: &ManagedIndex) -> Result<Vec<(String, Value)>, AppError> {
+    let searcher = managed.reader.searcher();
+    let id_field = managed.id_field();
+    let source_field = managed.source_field();
+    let mut docs = Vec::with_capacity(searcher.num_docs() as usize);
+
+    for segment_reader in searcher.segment_readers() {
+        let alive_bitset = segment_reader.alive_bitset();
+        let store_reader = segment_reader
+            .get_store_reader(1)
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        for doc_id in 0..segment_reader.max_doc() {
+            if let Some(alive) = alive_bitset
+                && !alive.is_alive(doc_id)
+            {
+                continue;
+            }
+            let retrieved: TantivyDocument = store_reader
+                .get(doc_id)
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            let Some(ext_id) = retrieved
+                .get_first(id_field)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let source_str = retrieved
+                .get_first(source_field)
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| AppError::Internal("missing _source in document".into()))?;
+            let val: Value =
+                serde_json::from_str(source_str).map_err(|e| AppError::Internal(e.to_string()))?;
+            docs.push((ext_id, val));
+        }
+    }
+    Ok(docs)
 }
 
 fn validate_index_name(name: &str) -> Result<(), AppError> {

@@ -436,10 +436,73 @@ pub fn discover_dictionaries(dir: &Path) -> Result<DiscoveredDictionaries, Strin
 ///    and its parent directory is scanned for any accompanying user dictionaries.
 /// 3. If neither is specified, `./resources` is checked as a default dictionary directory.
 /// 4. If no valid system dictionary is found anywhere, falls back to the built-in minimal dictionary.
-pub fn load_dictionary_from_dir(
+pub struct LoadedDictionary {
+    pub dict: Arc<JapaneseDictionary>,
+    pub fingerprint: String,
+}
+
+const FNV1A_128_OFFSET: u128 = 0x6c62272e07bb0142_62b821756295c58d;
+const FNV1A_128_PRIME: u128 = 0x0000000001000000_000000000000013b;
+
+fn fnv1a_update(hash: &mut u128, bytes: &[u8]) {
+    for &b in bytes {
+        *hash ^= b as u128;
+        *hash = hash.wrapping_mul(FNV1A_128_PRIME);
+    }
+}
+
+fn fnv1a_update_file(hash: &mut u128, tag: &str, path: &Path) -> Result<(), String> {
+    use std::io::Read;
+    fnv1a_update(hash, tag.as_bytes());
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    fnv1a_update(hash, file_name.as_bytes());
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| format!("failed to open {} for fingerprinting: {e}", path.display()))?;
+    let len = f
+        .metadata()
+        .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
+        .len();
+    fnv1a_update(hash, &len.to_le_bytes());
+
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        fnv1a_update(hash, &buf[..n]);
+    }
+    Ok(())
+}
+
+fn compute_dictionary_fingerprint(
+    sys_path: &Path,
+    user_paths: &[PathBuf],
+    custom_cfg_file: Option<&Path>,
+) -> Result<String, String> {
+    let mut hash = FNV1A_128_OFFSET;
+    fnv1a_update(&mut hash, b"tanpopo-dict-v1");
+    fnv1a_update_file(&mut hash, "sys:", sys_path)?;
+    for u in user_paths {
+        fnv1a_update_file(&mut hash, "usr:", u)?;
+    }
+    if let Some(cfg) = custom_cfg_file {
+        fnv1a_update_file(&mut hash, "cfg:", cfg)?;
+    }
+    Ok(format!("fnv1a128:{hash:032x}"))
+}
+
+/// Loads Sudachi dictionaries and computes a deterministic fingerprint covering
+/// the system dictionary, all user dictionaries, and any custom `sudachi.json`.
+pub fn load_dictionary_with_fingerprint(
     dict_dir: Option<&Path>,
     explicit_sys_dict: Option<&Path>,
-) -> Result<Arc<JapaneseDictionary>, String> {
+) -> Result<LoadedDictionary, String> {
     let mut resolved_system: Option<PathBuf> = None;
     let mut resolved_users: Vec<PathBuf> = Vec::new();
 
@@ -498,6 +561,7 @@ pub fn load_dictionary_from_dir(
                 .map_err(|e| format!("failed to canonicalize user dict {}: {e}", u.display()))?;
             user_paths_canonical.push(abs_u);
         }
+        user_paths_canonical.sort();
 
         // Check if there is a custom sudachi.json in the target directory
         let custom_cfg_file = target_dir
@@ -554,13 +618,32 @@ pub fn load_dictionary_from_dir(
             );
         }
 
-        return Ok(Arc::new(dict));
+        let fingerprint = compute_dictionary_fingerprint(
+            &abs_sys,
+            &user_paths_canonical,
+            custom_cfg_file.as_deref(),
+        )?;
+
+        return Ok(LoadedDictionary {
+            dict: Arc::new(dict),
+            fingerprint,
+        });
     }
 
     tracing::warn!(
         "No Sudachi system dictionary found (set TANPOPO_SUDACHI_DICT_DIR, TANPOPO_DICT_PATH, or place in ./resources/); using minimal built-in dictionary"
     );
-    build_fallback_dictionary()
+    Ok(LoadedDictionary {
+        dict: build_fallback_dictionary()?,
+        fingerprint: "builtin-fallback-v1".to_string(),
+    })
+}
+
+pub fn load_dictionary_from_dir(
+    dict_dir: Option<&Path>,
+    explicit_sys_dict: Option<&Path>,
+) -> Result<Arc<JapaneseDictionary>, String> {
+    load_dictionary_with_fingerprint(dict_dir, explicit_sys_dict).map(|loaded| loaded.dict)
 }
 
 /// Backward compatibility: loads dictionary with an optional system dictionary path.

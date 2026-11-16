@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use tanpopo_bm25::index::IndexManager;
 use tanpopo_bm25::server::build_router_with_ui;
-use tanpopo_bm25::tokenizer::load_dictionary_from_dir;
+use tanpopo_bm25::tokenizer::load_dictionary_with_fingerprint;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -29,8 +29,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(15_000_000);
 
-    let dict = load_dictionary_from_dir(dict_dir.as_deref(), dict_path.as_deref())?;
-    let mgr = Arc::new(IndexManager::new(data_dir.clone(), dict, writer_heap_bytes)?);
+    let loaded = load_dictionary_with_fingerprint(dict_dir.as_deref(), dict_path.as_deref())?;
+    let mgr = Arc::new(IndexManager::new_with_fingerprint(
+        data_dir.clone(),
+        loaded.dict,
+        loaded.fingerprint,
+        writer_heap_bytes,
+    )?);
     if mcp_stdio {
         return Ok(tokio::task::spawn_blocking(move || tanpopo_bm25::mcp::run_stdio_loop(mgr)).await??);
     }

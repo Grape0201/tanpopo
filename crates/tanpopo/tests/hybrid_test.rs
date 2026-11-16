@@ -268,3 +268,76 @@ async fn test_hybrid_search_rrf_doc_embedding_filter_and_mcp() {
     assert_eq!(idx_info["hearings"]["docs_count"], 3); // doc1, doc2, doc4 (doc3 deleted)
     assert_eq!(idx_info["hearings"]["vector_docs_count"], 3);
 }
+
+#[tokio::test]
+async fn test_hybrid_preserves_vectors_across_auto_rebuild() {
+    let data_dir = TempDir::new().unwrap();
+    let mock_url = spawn_mock_embedding_server().await;
+    let embedder: Arc<dyn Embedder> = Arc::new(HttpEmbedder::new(EmbedConfig::new(
+        mock_url,
+        "cl-nagoya/ruri-v3-310m",
+    )));
+
+    // 1. Create hybrid index & ingest a document with fingerprint v1
+    {
+        let dict = build_fallback_dictionary().unwrap();
+        let bm25 = Arc::new(
+            IndexManager::new_with_fingerprint(
+                data_dir.path().to_path_buf(),
+                dict,
+                "fp-v1".to_string(),
+                15_000_000,
+            )
+            .unwrap(),
+        );
+        let hybrid = Arc::new(HybridManager::new(bm25, Some(embedder.clone())).unwrap());
+        let app = build_router(hybrid);
+
+        let (status, _) = send_json(
+            &app,
+            Method::POST,
+            "/hearings/_doc/doc1?refresh=true",
+            Some(json!({
+                "title": "関西国際空港の調査",
+                "content": "騒音対策の報告書です。"
+            })),
+        )
+        .await;
+        assert!(status.is_success());
+    }
+
+    // 2. Restart with fingerprint v2 -> BM25 auto-rebuilds, vector store must remain intact
+    {
+        let dict = build_fallback_dictionary().unwrap();
+        let bm25 = Arc::new(
+            IndexManager::new_with_fingerprint(
+                data_dir.path().to_path_buf(),
+                dict,
+                "fp-v2".to_string(),
+                15_000_000,
+            )
+            .unwrap(),
+        );
+        let hybrid = Arc::new(HybridManager::new(bm25, Some(embedder)).unwrap());
+        let app = build_router(hybrid);
+
+        let (status, idx_info) = send_json(&app, Method::GET, "/hearings", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(idx_info["hearings"]["docs_count"], 1);
+        assert_eq!(idx_info["hearings"]["vector_docs_count"], 1);
+
+        let (status, res) = send_json(
+            &app,
+            Method::POST,
+            "/hearings/_search",
+            Some(json!({
+                "query": { "match": { "title": "関西国際空港" } },
+                "hybrid": { "enabled": true }
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(res["hits"]["total"]["value"], 1);
+        assert_eq!(res["hits"]["hits"][0]["_id"], "doc1");
+    }
+}
