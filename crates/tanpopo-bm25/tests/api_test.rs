@@ -916,9 +916,11 @@ async fn test_index_terms_and_exclude_user_dict() {
     let user_term = terms.iter().find(|t| t["term"] == "たんぽぽ検索").unwrap();
     assert_eq!(user_term["doc_freq"], 2);
     assert_eq!(user_term["in_user_dict"], true);
+    assert_eq!(user_term["pos"], "名詞");
     let sys_term = terms.iter().find(|t| t["term"] == "東京").unwrap();
     assert_eq!(sys_term["doc_freq"], 2);
     assert_eq!(sys_term["in_user_dict"], false);
+    assert_eq!(sys_term["pos"], "名詞");
 
     // 2. Exclude user dictionary terms
     let (status, res) = send_json(
@@ -940,6 +942,20 @@ async fn test_index_terms_and_exclude_user_dict() {
     let terms = res["terms"].as_array().unwrap();
     assert!(terms.iter().all(|t| t["term"].as_str().unwrap().contains("空港")));
     assert!(!terms.is_empty());
+
+    // 4. POS filter `pos`
+    let (status, res) = send_json(&app, Method::GET, "/docs/_terms?field=title&pos=名詞", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let terms = res["terms"].as_array().unwrap();
+    assert!(!terms.is_empty());
+    assert!(terms.iter().all(|t| t["pos"] == "名詞"));
+    assert!(terms.iter().any(|t| t["term"] == "東京"));
+
+    let (status, res) = send_json(&app, Method::GET, "/docs/_terms?field=title&pos=助詞", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let terms = res["terms"].as_array().unwrap();
+    assert!(terms.iter().all(|t| t["pos"] == "助詞"));
+    assert!(!terms.iter().any(|t| t["term"] == "東京"));
 }
 
 #[tokio::test]

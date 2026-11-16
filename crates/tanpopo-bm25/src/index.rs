@@ -988,6 +988,7 @@ impl IndexManager {
         index_name: &str,
         field_name: Option<&str>,
         query: Option<&str>,
+        pos_filter: Option<&str>,
         limit: usize,
         exclude_user_dict: bool,
     ) -> Result<IndexTermsResponse, AppError> {
@@ -1044,14 +1045,20 @@ impl IndexManager {
         sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         let limit = limit.clamp(1, 1000);
+        let pos_filter = pos_filter.map(str::trim).filter(|s| !s.is_empty());
         let mut checker = UserDictChecker::new(&self.dict);
         let mut excluded_user_dict_terms = 0usize;
         let mut terms = Vec::with_capacity(limit.min(sorted.len()));
 
         for (term, doc_freq) in sorted {
-            let in_user_dict = checker.is_user_dict_term(&term);
+            let (in_user_dict, pos) = checker.inspect_term(&term);
             if exclude_user_dict && in_user_dict {
                 excluded_user_dict_terms += 1;
+                continue;
+            }
+            if let Some(target_pos) = pos_filter
+                && pos != target_pos
+            {
                 continue;
             }
             if terms.len() < limit {
@@ -1059,6 +1066,7 @@ impl IndexManager {
                     term,
                     doc_freq,
                     in_user_dict,
+                    pos,
                 });
             } else if !exclude_user_dict {
                 break;
@@ -1081,6 +1089,7 @@ pub struct TermStat {
     pub term: String,
     pub doc_freq: u64,
     pub in_user_dict: bool,
+    pub pos: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

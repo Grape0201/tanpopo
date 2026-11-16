@@ -323,6 +323,8 @@ struct TermsQuery {
     #[serde(default)]
     q: Option<String>,
     #[serde(default)]
+    pos: Option<String>,
+    #[serde(default)]
     limit: Option<usize>,
     #[serde(default)]
     exclude_user_dict: Option<bool>,
@@ -337,6 +339,7 @@ async fn get_index_terms_handler(
         &index,
         q.field.as_deref(),
         q.q.as_deref(),
+        q.pos.as_deref(),
         q.limit.unwrap_or(100),
         q.exclude_user_dict.unwrap_or(false),
     )?;

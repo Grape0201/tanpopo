@@ -198,8 +198,13 @@ impl<'a> UserDictChecker<'a> {
     }
 
     pub fn is_user_dict_term(&mut self, term: &str) -> bool {
+        self.inspect_term(term).0
+    }
+
+    /// Returns `(in_user_dict, pos)` for a single term string.
+    pub fn inspect_term(&mut self, term: &str) -> (bool, String) {
         if term.is_empty() {
-            return false;
+            return (false, String::new());
         }
         // Exact surface match in any user dictionary (dict_id >= 1; 0 is system dict).
         let exact_match = self
@@ -207,23 +212,30 @@ impl<'a> UserDictChecker<'a> {
             .lexicon()
             .lookup(term.as_bytes(), 0)
             .any(|entry| entry.end == term.len() && entry.word_id.dict().as_raw() >= 1);
-        if exact_match {
-            return true;
-        }
-        // Fallback: check if Sudachi tokenizes the term as a single user-dictionary morpheme.
+
         self.stateful.reset().push_str(term);
-        if self.stateful.do_tokenize().is_err() {
-            return false;
+        if self.stateful.do_tokenize().is_err()
+            || self.morphemes.collect_results(&mut self.stateful).is_err()
+        {
+            return (exact_match, String::new());
         }
-        if self.morphemes.collect_results(&mut self.stateful).is_err() {
-            return false;
-        }
-        self.morphemes.len() == 1
-            && self
-                .morphemes
+        let in_user_dict = exact_match
+            || (self.morphemes.len() == 1
+                && self
+                    .morphemes
+                    .iter()
+                    .next()
+                    .is_some_and(|m| m.dictionary_id() >= 1));
+        let pos = if self.morphemes.len() == 1 {
+            self.morphemes
                 .iter()
                 .next()
-                .is_some_and(|m| m.dictionary_id() >= 1)
+                .and_then(|m| m.part_of_speech().first().cloned())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        (in_user_dict, pos)
     }
 }
 

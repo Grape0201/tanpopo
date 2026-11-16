@@ -72,6 +72,23 @@
   <div class="row">
     <select id="ins-index"></select>
     <select id="ins-field"><option value="_all">_all</option></select>
+    <select id="ins-pos">
+      <option value="">すべての品詞</option>
+      <option value="名詞">名詞</option>
+      <option value="動詞">動詞</option>
+      <option value="形容詞">形容詞</option>
+      <option value="形状詞">形状詞</option>
+      <option value="副詞">副詞</option>
+      <option value="連体詞">連体詞</option>
+      <option value="接続詞">接続詞</option>
+      <option value="感動詞">感動詞</option>
+      <option value="助動詞">助動詞</option>
+      <option value="助詞">助詞</option>
+      <option value="接頭辞">接頭辞</option>
+      <option value="接尾辞">接尾辞</option>
+      <option value="記号">記号</option>
+      <option value="補助記号">補助記号</option>
+    </select>
     <input id="ins-q" class="q" type="text" placeholder="トークン絞り込み（部分一致）">
     <label>件数 <select id="ins-limit"><option>100</option><option>200</option><option>500</option></select></label>
     <label><input id="ins-excl" type="checkbox"> ユーザ定義辞書を除外</label>
@@ -206,13 +223,14 @@ async function loadTerms(idx) {
     exclude_user_dict: String($('ins-excl').checked),
   });
   if ($('ins-q').value.trim()) params.set('q', $('ins-q').value.trim());
+  if ($('ins-pos').value) params.set('pos', $('ins-pos').value);
   const res = await call('/' + encodeURIComponent(idx) + '/_terms?' + params.toString());
   const exclInfo = res.excluded_user_dict_terms ? ` / ユーザ辞書除外: ${res.excluded_user_dict_terms} 件` : '';
   $('ins-summary').textContent = `ドキュメント数: ${res.total_docs} / ユニークトークン数: ${res.total_unique_terms}${exclInfo} / 表示: ${res.terms.length} 件`;
   const maxFreq = res.terms.reduce((m, t) => Math.max(m, t.doc_freq), 1);
   const tbl = el('table');
   const head = el('tr');
-  ['#', 'トークン', '出現ドキュメント数', '辞書'].forEach(h => head.append(el('th', h)));
+  ['#', 'トークン', '品詞', '出現ドキュメント数', '辞書'].forEach(h => head.append(el('th', h)));
   tbl.append(head);
   res.terms.forEach((t, i) => {
     const tr = el('tr');
@@ -225,7 +243,7 @@ async function loadTerms(idx) {
     const dictTd = el('td');
     if (t.in_user_dict) dictTd.append(el('span', 'ユーザ辞書', 'badge'));
     else dictTd.textContent = '-';
-    tr.append(el('td', String(i + 1)), el('td', t.term), freqTd, dictTd);
+    tr.append(el('td', String(i + 1)), el('td', t.term), el('td', t.pos || '-'), freqTd, dictTd);
     tbl.append(tr);
   });
   $('ins-terms').append(tbl);
@@ -241,6 +259,7 @@ async function loadInspect(refreshMapping = true) {
 }
 $('ins-index').onchange = () => loadInspect(true);
 $('ins-field').onchange = () => loadInspect(false);
+$('ins-pos').onchange = () => loadInspect(false);
 $('ins-excl').onchange = () => loadInspect(false);
 $('ins-limit').onchange = () => loadInspect(false);
 $('ins-go').onclick = () => loadInspect(false);
